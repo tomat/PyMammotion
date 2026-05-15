@@ -383,14 +383,19 @@ class MowerStateReducer(StateReducer):
                         device.mower_state.animal_protection.status = settings.context
             case "todev_unable_time_set":
                 nav_non_work_time: NavUnableTimeSet = nav_msg[1]
-                target = (
-                    device.animal_protection_hours
-                    if nav_non_work_time.trigger == 99
-                    else device.non_work_hours
-                )
+                if nav_non_work_time.trigger == 99:
+                    # Animal protection reports the allowed daylight window;
+                    # expose the complementary non-working window.
+                    target = device.animal_protection_hours
+                    start_time = nav_non_work_time.unable_end_time
+                    end_time = nav_non_work_time.unable_start_time
+                else:
+                    target = device.non_work_hours
+                    start_time = nav_non_work_time.unable_start_time
+                    end_time = nav_non_work_time.unable_end_time
                 target.sub_cmd = nav_non_work_time.sub_cmd
-                target.start_time = nav_non_work_time.unable_start_time
-                target.end_time = nav_non_work_time.unable_end_time
+                target.start_time = start_time
+                target.end_time = end_time
                 target.trigger = nav_non_work_time.trigger
             case "todev_taskctrl_ack":
                 task_ctrl_ack: NavTaskCtrlAck = nav_msg[1]
