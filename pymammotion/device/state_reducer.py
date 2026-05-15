@@ -146,7 +146,7 @@ class MowerStateReducer(StateReducer):
                 # Granular dispatch — each nav sub-message only mutates a
                 # subset of fields.  Copying map (HashList) on every nav
                 # message was a ~150 MiB/h leak (#125).
-                nav_msg_name = betterproto2.which_one_of(message.nav, "SubNavMsg")[0]
+                nav_msg_name, nav_msg_value = betterproto2.which_one_of(message.nav, "SubNavMsg")
                 match nav_msg_name:
                     case (
                         "toapp_gethash_ack"
@@ -166,7 +166,10 @@ class MowerStateReducer(StateReducer):
                     case "nav_sys_param_cmd":
                         device.mower_state = copy.deepcopy(current.mower_state)
                     case "todev_unable_time_set":
-                        device.non_work_hours = copy.deepcopy(current.non_work_hours)
+                        if getattr(nav_msg_value, "trigger", 0) == 99:
+                            device.animal_protection_hours = copy.deepcopy(current.animal_protection_hours)
+                        else:
+                            device.non_work_hours = copy.deepcopy(current.non_work_hours)
                     case "toapp_work_report_ack" | "toapp_work_report_upload":
                         device.work_session_result = copy.deepcopy(current.work_session_result)
                     case _:
@@ -175,6 +178,7 @@ class MowerStateReducer(StateReducer):
                         device.work = copy.deepcopy(current.work)
                         device.mower_state = copy.deepcopy(current.mower_state)
                         device.non_work_hours = copy.deepcopy(current.non_work_hours)
+                        device.animal_protection_hours = copy.deepcopy(current.animal_protection_hours)
                         device.work_session_result = copy.deepcopy(current.work_session_result)
                 self._update_nav_data(device, message)
 
@@ -379,9 +383,15 @@ class MowerStateReducer(StateReducer):
                         device.mower_state.animal_protection.status = settings.context
             case "todev_unable_time_set":
                 nav_non_work_time: NavUnableTimeSet = nav_msg[1]
-                device.non_work_hours.non_work_sub_cmd = nav_non_work_time.sub_cmd
-                device.non_work_hours.start_time = nav_non_work_time.unable_start_time
-                device.non_work_hours.end_time = nav_non_work_time.unable_end_time
+                target = (
+                    device.animal_protection_hours
+                    if nav_non_work_time.trigger == 99
+                    else device.non_work_hours
+                )
+                target.sub_cmd = nav_non_work_time.sub_cmd
+                target.start_time = nav_non_work_time.unable_start_time
+                target.end_time = nav_non_work_time.unable_end_time
+                target.trigger = nav_non_work_time.trigger
             case "todev_taskctrl_ack":
                 task_ctrl_ack: NavTaskCtrlAck = nav_msg[1]
                 device.report_data.dev.sys_status = task_ctrl_ack.nav_state
