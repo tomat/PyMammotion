@@ -65,6 +65,7 @@ class MowerDevice(Device):
     device_firmwares: DeviceFirmwares = field(default_factory=DeviceFirmwares)
     errors: DeviceErrors = field(default_factory=DeviceErrors)
     non_work_hours: DeviceNonWorkingHours = field(default_factory=DeviceNonWorkingHours)
+    animal_protection_hours: DeviceNonWorkingHours = field(default_factory=DeviceNonWorkingHours)
     events: Events = field(default_factory=Events)
     work_session_result: WorkSessionResult = field(default_factory=WorkSessionResult)
 
