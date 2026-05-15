@@ -11,16 +11,16 @@ from __future__ import annotations
 from pymammotion.data.model.device import MowerDevice
 from pymammotion.data.model.hash_list import AreaHashNameList
 from pymammotion.device.state_reducer import MowerStateReducer
-from pymammotion.proto import (
-    LubaMsg,
-    MctlNav,
-    NavGetAllPlanTask,
-    NavReqCoverPath,
-    NavSysParamMsg,
-    NavUnableTimeSet,
-)
+from pymammotion.proto import LubaMsg, MctlNav, NavGetAllPlanTask, NavReqCoverPath, NavSysParamMsg, NavUnableTimeSet
 
-_ALL_FIELDS = ("map", "work", "mower_state", "non_work_hours", "work_session_result")
+_ALL_FIELDS = (
+    "map",
+    "work",
+    "mower_state",
+    "non_work_hours",
+    "animal_protection_hours",
+    "work_session_result",
+)
 
 
 def _make_device() -> MowerDevice:
@@ -69,7 +69,35 @@ def test_unable_time_set_only_copies_non_work_hours() -> None:
     updated = reducer.apply(current, msg)
     _assert_sharing(current, updated, copied_fields=("non_work_hours",))
     assert updated.non_work_hours.start_time == "22:00"
+    assert updated.non_work_hours.sub_cmd == 1
+    assert updated.non_work_hours.trigger == 0
     assert current.non_work_hours.start_time == ""
+
+
+def test_animal_protection_unable_time_does_not_overwrite_non_work_hours() -> None:
+    reducer = MowerStateReducer()
+    current = _make_device()
+    current.non_work_hours.start_time = "1430"
+    current.non_work_hours.end_time = "415"
+    msg = LubaMsg(
+        nav=MctlNav(
+            todev_unable_time_set=NavUnableTimeSet(
+                sub_cmd=2,
+                trigger=99,
+                unable_start_time="256",
+                unable_end_time="1275",
+            )
+        )
+    )
+    updated = reducer.apply(current, msg)
+    _assert_sharing(current, updated, copied_fields=("animal_protection_hours",))
+    assert updated.non_work_hours.start_time == "1430"
+    assert updated.non_work_hours.end_time == "415"
+    assert updated.animal_protection_hours.start_time == "256"
+    assert updated.animal_protection_hours.end_time == "1275"
+    assert updated.animal_protection_hours.sub_cmd == 2
+    assert updated.animal_protection_hours.trigger == 99
+    assert current.animal_protection_hours.start_time == ""
 
 
 def test_all_plan_task_only_copies_map() -> None:
@@ -95,5 +123,4 @@ def test_bidire_reqconver_path_copies_nothing_but_rebinds_work() -> None:
     # But device.work was rebuilt by the handler and current.work is untouched
     assert updated.work is not original_work
     assert current.work is original_work
-
 

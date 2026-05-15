@@ -23,6 +23,7 @@ class DeviceNonWorkingHours(DataClassORJSONMixin):
     sub_cmd: int = 0
     start_time: str = ""
     end_time: str = ""
+    trigger: int = 0
 
 
 @dataclass
