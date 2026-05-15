@@ -74,7 +74,7 @@ def test_unable_time_set_only_copies_non_work_hours() -> None:
     assert current.non_work_hours.start_time == ""
 
 
-def test_animal_protection_unable_time_does_not_overwrite_non_work_hours() -> None:
+def test_animal_protection_unable_time_stores_non_work_complement() -> None:
     reducer = MowerStateReducer()
     current = _make_device()
     current.non_work_hours.start_time = "1430"
@@ -93,8 +93,8 @@ def test_animal_protection_unable_time_does_not_overwrite_non_work_hours() -> No
     _assert_sharing(current, updated, copied_fields=("animal_protection_hours",))
     assert updated.non_work_hours.start_time == "1430"
     assert updated.non_work_hours.end_time == "415"
-    assert updated.animal_protection_hours.start_time == "256"
-    assert updated.animal_protection_hours.end_time == "1275"
+    assert updated.animal_protection_hours.start_time == "1275"
+    assert updated.animal_protection_hours.end_time == "256"
     assert updated.animal_protection_hours.sub_cmd == 2
     assert updated.animal_protection_hours.trigger == 99
     assert current.animal_protection_hours.start_time == ""
@@ -123,4 +123,3 @@ def test_bidire_reqconver_path_copies_nothing_but_rebinds_work() -> None:
     # But device.work was rebuilt by the handler and current.work is untouched
     assert updated.work is not original_work
     assert current.work is original_work
-
