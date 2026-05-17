@@ -6,9 +6,12 @@ import asyncio
 import base64
 import contextlib
 import dataclasses
+from datetime import UTC, datetime
 import logging
 import time
 from typing import TYPE_CHECKING, TypeVar
+
+import betterproto2
 
 from pymammotion.aliyun.exceptions import DeviceOfflineException, TooManyRequestsException
 from pymammotion.data.mqtt.event import DeviceProtobufMsgEventParams
@@ -396,6 +399,74 @@ class DeviceHandle:
         if transport is not None:
             await transport.disconnect()
 
+    @staticmethod
+    def _protobuf_source_name(luba_msg: LubaMsg) -> str:
+        """Return a compact packet source name for diagnostics."""
+        msg_group, msg_value = betterproto2.which_one_of(luba_msg, "LubaSubMsg")
+        if not msg_group:
+            return "unknown"
+        if msg_group == "sys" and msg_value is not None:
+            sys_name = betterproto2.which_one_of(msg_value, "SubSysMsg")[0]
+            return f"sys.{sys_name}" if sys_name else "sys.unknown"
+        return msg_group
+
+    @staticmethod
+    def _device_battery_value(device: Device) -> int | None:
+        """Read a mower battery value from a device model, if it has one."""
+        report_data = getattr(device, "report_data", None)
+        dev = getattr(report_data, "dev", None) if report_data is not None else None
+        battery = getattr(dev, "battery_val", None) if dev is not None else None
+        if isinstance(battery, bool) or not isinstance(battery, int | float):
+            return None
+        return int(battery)
+
+    def _record_battery_update(
+        self,
+        device: Device,
+        previous: int,
+        value: int,
+        source: str,
+        transport_type: TransportType,
+    ) -> None:
+        """Store and log battery update provenance on mower devices."""
+        if not hasattr(device, "last_battery_update_source"):
+            return
+        report_data = getattr(device, "report_data", None)
+        dev = getattr(report_data, "dev", None) if report_data is not None else None
+        sys_status = self._int_or_zero(getattr(dev, "sys_status", 0)) if dev is not None else 0
+        charge_state = self._int_or_zero(getattr(dev, "charge_state", 0)) if dev is not None else 0
+
+        device.last_battery_update_source = source  # type: ignore[attr-defined]
+        device.last_battery_update_transport = transport_type.value  # type: ignore[attr-defined]
+        device.last_battery_update_previous = previous  # type: ignore[attr-defined]
+        device.last_battery_update_value = value  # type: ignore[attr-defined]
+        device.last_battery_update_at = datetime.now(UTC).isoformat(  # type: ignore[attr-defined]
+            timespec="seconds"
+        )
+        device.last_battery_update_sys_status = sys_status  # type: ignore[attr-defined]
+        device.last_battery_update_charge_state = charge_state  # type: ignore[attr-defined]
+
+        log_fn = _logger.warning if value == 100 or previous == 100 or abs(value - previous) >= 20 else _logger.debug
+        log_fn(
+            "Battery update for %s: %s%% -> %s%% via %s over %s "
+            "(sys_status=%s charge_state=%s)",
+            self.device_name,
+            previous,
+            value,
+            source,
+            transport_type.value,
+            sys_status,
+            charge_state,
+        )
+
+    @staticmethod
+    def _int_or_zero(value: object) -> int:
+        """Convert numeric-ish diagnostics to int for logging."""
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
     async def on_raw_message(self, payload: bytes, transport_type: TransportType = TransportType.CLOUD_ALIYUN) -> None:
         """Receive raw bytes from transport, decode, update state, route to broker.
 
@@ -425,7 +496,17 @@ class DeviceHandle:
             self.update_availability(transport_type, self._availability.mqtt, mqtt_reported_offline=False)
 
         # 3. Apply to state via reducer (returns a new MowingDevice copy)
+        old_battery = self._device_battery_value(self.state_machine.current.raw)
         updated_device = self._reducer.apply(self.state_machine.current.raw, luba_msg)
+        new_battery = self._device_battery_value(updated_device)
+        if old_battery is not None and new_battery is not None and old_battery != new_battery:
+            self._record_battery_update(
+                updated_device,
+                old_battery,
+                new_battery,
+                self._protobuf_source_name(luba_msg),
+                transport_type,
+            )
 
         # 4. Update state machine and emit if anything in the model changed.
         # _diff now walks `raw`, so deep-field mutations (e.g.

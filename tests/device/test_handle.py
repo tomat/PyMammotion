@@ -12,7 +12,6 @@ from pymammotion.messaging.command_queue import Priority
 from pymammotion.state.device_state import DeviceAvailability, DeviceConnectionState, TransportAvailability
 from pymammotion.transport.base import NoTransportAvailableError, TransportType
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -440,6 +439,34 @@ async def test_snapshot_raw_updates_after_on_raw_message() -> None:
     await handle.on_raw_message(bytes(msg))
 
     assert handle.snapshot.raw.report_data.dev.battery_val == 42
+
+
+async def test_battery_update_records_source_and_transport() -> None:
+    """Battery changes retain the protobuf source and inbound transport."""
+    from pymammotion.data.model.device import MowerDevice
+    from pymammotion.proto import LubaMsg, MctlSys, SysBatUp
+
+    handle = DeviceHandle(
+        device_id="dev-battery-source",
+        device_name="Yuka-Battery",
+        initial_device=MowerDevice(name="Yuka-Battery"),
+    )
+    handle.snapshot.raw.report_data.dev.battery_val = 35
+    handle.snapshot.raw.report_data.dev.sys_status = 7
+    handle.snapshot.raw.report_data.dev.charge_state = 1
+
+    msg = LubaMsg(sys=MctlSys(toapp_batinfo=SysBatUp(bat_val=74)))
+    await handle.on_raw_message(bytes(msg), TransportType.BLE)
+
+    raw = handle.snapshot.raw
+    assert raw.report_data.dev.battery_val == 74
+    assert raw.last_battery_update_source == "sys.toapp_batinfo"
+    assert raw.last_battery_update_transport == "ble"
+    assert raw.last_battery_update_previous == 35
+    assert raw.last_battery_update_value == 74
+    assert raw.last_battery_update_sys_status == 7
+    assert raw.last_battery_update_charge_state == 1
+    assert raw.last_battery_update_at
 
 
 # ---------------------------------------------------------------------------

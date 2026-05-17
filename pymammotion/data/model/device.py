@@ -77,6 +77,13 @@ class MowerDevice(Device):
     animal_protection_hours: DeviceNonWorkingHours = field(default_factory=DeviceNonWorkingHours)
     events: Events = field(default_factory=Events)
     work_session_result: WorkSessionResult = field(default_factory=WorkSessionResult)
+    last_battery_update_source: str = ""
+    last_battery_update_transport: str = ""
+    last_battery_update_previous: int = 0
+    last_battery_update_value: int = 0
+    last_battery_update_at: str = ""
+    last_battery_update_sys_status: int = 0
+    last_battery_update_charge_state: int = 0
 
     @property
     def device_limits(self) -> DeviceLimits:
