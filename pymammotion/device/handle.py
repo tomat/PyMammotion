@@ -253,8 +253,9 @@ class DeviceHandle:
         self._last_report_at: float = 0.0
         #: Snapshot of the previous active_transport selection / availability so
         #: the DEBUG log can suppress repeats — only the transitions matter.
-        #: Tuple of (selection_path, prefer_ble, ble_usable, mqtt_usable).
-        self._last_active_transport_log: tuple[str, bool, bool, bool] | None = None
+        #: Tuple of (selection_path, prefer_ble, ble_usable, mqtt_connected,
+        #: mqtt_usable, mqtt_reported_offline).
+        self._last_active_transport_log: tuple[str, bool, bool, bool, bool, bool] | None = None
         #: Timer handle for the transient continuous-stream auto-stop.
         self._report_stream_timer: asyncio.TimerHandle | None = None
         # Wire up critical error propagation from queue
@@ -1704,11 +1705,11 @@ class DeviceHandle:
         Returning a non-usable BLE transport would cause callers to attempt a
         connect we already know will fail.
 
-        MQTT is considered unusable when the cloud has reported the device as
-        offline (``mqtt_reported_offline`` is True).  In that state we raise
-        ``NoTransportAvailableError`` rather than firing commands into the
-        cloud that the device can't receive.  The flag is automatically
-        cleared by ``on_raw_message`` as soon as any MQTT frame arrives.
+        MQTT is considered usable when the transport is connected, even if the
+        last device-status event reported the mower offline.  That lets one-shot
+        report probes recover from a stale ``mqtt_reported_offline`` latch; if
+        the backend still rejects the send, the existing ``DeviceOfflineException``
+        path records the offline state again.
 
         Args:
             prefer_ble: Per-call override.  When None (default) the handle's
@@ -1733,15 +1734,16 @@ class DeviceHandle:
                 mqtt = t
                 break
         mqtt_registered = mqtt is not None
-        mqtt_usable = mqtt is not None and not mqtt_reported_offline and mqtt.is_usable
+        mqtt_connected = mqtt is not None and mqtt.is_connected
+        mqtt_usable = mqtt is not None and mqtt.is_usable and (not mqtt_reported_offline or mqtt_connected)
 
         def _log_selection(path: str, *args: Any) -> None:
-            """Log only when the (path, prefer_ble, ble_usable, mqtt_usable) tuple changes.
+            """Log only when the active-transport selection tuple changes.
 
             Senders churn on this every poll; logging on every call buries the
             transitions that actually matter (BLE drop / recover, MQTT offline).
             """
-            key = (path, use_ble_first, ble_usable, mqtt_usable)
+            key = (path, use_ble_first, ble_usable, mqtt_connected, mqtt_usable, mqtt_reported_offline)
             if self._last_active_transport_log == key:
                 return
             self._last_active_transport_log = key
