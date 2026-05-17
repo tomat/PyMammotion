@@ -510,12 +510,12 @@ async def test_on_raw_message_emits_even_when_diff_is_empty() -> None:
 
 
 # ---------------------------------------------------------------------------
-# MQTT unusable when mqtt_reported_offline: active_transport skips MQTT
+# Connected MQTT can recover from a stale mqtt_reported_offline latch
 # ---------------------------------------------------------------------------
 
 
-async def test_active_transport_skips_mqtt_when_reported_offline() -> None:
-    """mqtt_reported_offline=True → MQTT treated as unusable; BLE used if registered."""
+async def test_active_transport_uses_connected_mqtt_when_reported_offline() -> None:
+    """A connected MQTT transport can probe/recover from a stale offline latch."""
     mqtt = make_transport(TransportType.CLOUD_ALIYUN, connected=True)
     ble = make_transport(TransportType.BLE, connected=False)  # registered, not connected
 
@@ -526,12 +526,12 @@ async def test_active_transport_skips_mqtt_when_reported_offline() -> None:
     handle.update_availability(TransportType.CLOUD_ALIYUN, TransportAvailability.CONNECTED, mqtt_reported_offline=True)
 
     active = handle.active_transport()
-    assert active.transport_type == TransportType.BLE
+    assert active.transport_type == TransportType.CLOUD_ALIYUN
 
 
-async def test_active_transport_raises_when_only_mqtt_and_offline() -> None:
-    """mqtt_reported_offline=True and no BLE → NoTransportAvailableError."""
-    mqtt = make_transport(TransportType.CLOUD_ALIYUN, connected=True)
+async def test_active_transport_raises_when_only_disconnected_mqtt_and_offline() -> None:
+    """mqtt_reported_offline=True and disconnected MQTT remains unusable."""
+    mqtt = make_transport(TransportType.CLOUD_ALIYUN, connected=False)
     handle = make_handle()
     await handle.add_transport(mqtt)
 

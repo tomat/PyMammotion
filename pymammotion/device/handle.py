@@ -1397,11 +1397,11 @@ class DeviceHandle:
         Returning a non-usable BLE transport would cause callers to attempt a
         connect we already know will fail.
 
-        MQTT is considered unusable when the cloud has reported the device as
-        offline (``mqtt_reported_offline`` is True).  In that state we raise
-        ``NoTransportAvailableError`` rather than firing commands into the
-        cloud that the device can't receive.  The flag is automatically
-        cleared by ``on_raw_message`` as soon as any MQTT frame arrives.
+        MQTT is considered usable when the transport is connected, even if the
+        last device-status event reported the mower offline.  That lets one-shot
+        report probes recover from a stale ``mqtt_reported_offline`` latch; if
+        the backend still rejects the send, the existing ``DeviceOfflineException``
+        path records the offline state again.
 
         Args:
             prefer_ble: Per-call override.  When None (default) the handle's
@@ -1426,16 +1426,18 @@ class DeviceHandle:
                 mqtt = t
                 break
         mqtt_registered = mqtt is not None
-        mqtt_usable = mqtt is not None and not mqtt_reported_offline and mqtt.is_usable
+        mqtt_connected = mqtt is not None and mqtt.is_connected
+        mqtt_usable = mqtt is not None and mqtt.is_usable and (not mqtt_reported_offline or mqtt_connected)
 
         _logger.debug(
             "active_transport '%s': prefer_ble=%s ble_connected=%s ble_usable=%s"
-            " mqtt_registered=%s mqtt_usable=%s mqtt_offline=%s",
+            " mqtt_registered=%s mqtt_connected=%s mqtt_usable=%s mqtt_offline=%s",
             self.device_name,
             use_ble_first,
             ble_connected,
             ble_usable,
             mqtt_registered,
+            mqtt_connected,
             mqtt_usable,
             mqtt_reported_offline,
         )
