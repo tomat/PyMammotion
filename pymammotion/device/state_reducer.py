@@ -206,6 +206,11 @@ class MowerStateReducer(StateReducer):
                         device.map = copy.deepcopy(current.map)
                         device.work = copy.deepcopy(current.work)
                         device.device_firmwares = copy.deepcopy(current.device_firmwares)
+                    case "toapp_batinfo" | "toapp_work_state" | "toapp_mow_info":
+                        # Lightweight app status packets update the same cached
+                        # report_data fields HA reads for battery, state, cutter,
+                        # and RTK summary.
+                        device.report_data = copy.deepcopy(current.report_data)
                     case "toapp_dev_fw_info":
                         # Only sys handler that touches both mower_state and device_firmwares.
                         device.mower_state = copy.deepcopy(current.mower_state)
@@ -434,6 +439,12 @@ class MowerStateReducer(StateReducer):
                     device.map.generate_geojson(device.location.RTK, device.location.dock)
             case "toapp_report_data":
                 device.update_report_data(sys_msg[1])
+            case "toapp_batinfo":
+                device.battery_info(sys_msg[1])
+            case "toapp_work_state":
+                device.work_state_info(sys_msg[1])
+            case "toapp_mow_info":
+                device.toapp_mow_info(sys_msg[1])
             case "mow_to_app_info":
                 device.mow_info(sys_msg[1])
             case "system_tard_state_tunnel":

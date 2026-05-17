@@ -15,13 +15,22 @@ from pymammotion.data.model.errors import DeviceErrors
 from pymammotion.data.model.events import Events
 from pymammotion.data.model.location import Location
 from pymammotion.data.model.pool_state import PoolMap, PoolState
-from pymammotion.data.model.report_info import BaseScore, ReportData, WorkSessionResult
+from pymammotion.data.model.report_info import BaseScore, LocationData, ReportData, WorkSessionResult
 from pymammotion.data.model.work import CurrentTaskSettings
 from pymammotion.data.mqtt.event import ThingEventMessage
 from pymammotion.data.mqtt.properties import ThingPropertiesMessage
 from pymammotion.data.mqtt.status import ThingStatusMessage
 from pymammotion.http.model.http import CheckDeviceVersion
-from pymammotion.proto import DeviceFwInfo, MowToAppInfoT, ReportInfoData, SystemTardStateTunnelMsg, SystemUpdateBufMsg
+from pymammotion.proto import (
+    DeviceFwInfo,
+    MowToAppInfoT,
+    ReportInfoData,
+    SysBatUp,
+    SysMowInfo,
+    SystemTardStateTunnelMsg,
+    SystemUpdateBufMsg,
+    SysWorkState,
+)
 from pymammotion.utility.constant import MOWING_ACTIVE_MODES
 from pymammotion.utility.conversions import parse_double
 from pymammotion.utility.device_config import DeviceConfig
@@ -222,8 +231,32 @@ class MowerDevice(Device):
         self.location.device = coordinate_converter.enu_to_lla(north_geo, east_geo)
         self.location.work_zone = self.mowing_state.zone_hash
 
+    def battery_info(self, toapp_batinfo: SysBatUp) -> None:
+        """Apply the lightweight battery update sent as sys.toapp_batinfo."""
+        self.report_data.dev.battery_val = int(toapp_batinfo.bat_val)
+
+    def work_state_info(self, toapp_work_state: SysWorkState) -> None:
+        """Apply the lightweight state update sent as sys.toapp_work_state."""
+        self.report_data.dev.sys_status = int(toapp_work_state.device_state)
+        self.report_data.dev.charge_state = int(toapp_work_state.charge_state)
+        self.report_data.work.path_hash = int(toapp_work_state.path_hash)
+
+        cm_hash = int(toapp_work_state.cm_hash)
+        if self.report_data.locations:
+            self.report_data.locations[0].bol_hash = cm_hash
+        else:
+            self.report_data.locations.append(LocationData(bol_hash=cm_hash))
+
+    def toapp_mow_info(self, toapp_mow_info: SysMowInfo) -> None:
+        """Apply device/cutter/battery info sent as sys.toapp_mow_info."""
+        self.report_data.dev.sys_status = int(toapp_mow_info.device_state)
+        self.report_data.dev.battery_val = int(toapp_mow_info.bat_val)
+        self.report_data.work.knife_height = int(toapp_mow_info.knife_height)
+        self.report_data.rtk.status = int(toapp_mow_info.rt_kstatus)
+        self.report_data.rtk.gps_stars = int(toapp_mow_info.rt_kstars)
+
     def mow_info(self, toapp_mow_info: MowToAppInfoT) -> None:
-        """Set mow info."""
+        """Handle sys.mow_to_app_info; distinct from sys.toapp_mow_info."""
 
     def report_missing_data(self) -> list[str]:
         """Report what data is missing for basic operation."""
