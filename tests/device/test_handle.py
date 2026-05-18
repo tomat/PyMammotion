@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -465,6 +466,44 @@ async def test_battery_update_records_source_and_transport() -> None:
     assert raw.last_battery_update_previous == 35
     assert raw.last_battery_update_value == 74
     assert raw.last_battery_update_sys_status == 7
+    assert raw.last_battery_update_charge_state == 1
+    assert raw.last_battery_update_at
+
+
+async def test_property_battery_update_records_source() -> None:
+    """Battery changes from thing/properties retain explicit provenance."""
+    from pymammotion.data.model.device import MowerDevice
+    from pymammotion.data.mqtt.properties import Item, Items
+
+    handle = DeviceHandle(
+        device_id="dev-property-battery-source",
+        device_name="Yuka-Battery",
+        initial_device=MowerDevice(name="Yuka-Battery"),
+    )
+    handle.snapshot.raw.report_data.dev.battery_val = 100
+    handle.snapshot.raw.report_data.dev.sys_status = 11
+    handle.snapshot.raw.report_data.dev.charge_state = 1
+
+    properties = SimpleNamespace(
+        params=SimpleNamespace(
+            items=Items(
+                batteryPercentage=Item(
+                    time=0,
+                    value=37,
+                )
+            )
+        )
+    )
+
+    await handle.on_device_properties(properties)
+
+    raw = handle.snapshot.raw
+    assert raw.report_data.dev.battery_val == 37
+    assert raw.last_battery_update_source == "thing.properties.batteryPercentage"
+    assert raw.last_battery_update_transport == "cloud_aliyun"
+    assert raw.last_battery_update_previous == 100
+    assert raw.last_battery_update_value == 37
+    assert raw.last_battery_update_sys_status == 11
     assert raw.last_battery_update_charge_state == 1
     assert raw.last_battery_update_at
 

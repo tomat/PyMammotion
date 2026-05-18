@@ -569,14 +569,28 @@ class DeviceHandle:
     async def on_device_properties(self, properties: ThingPropertiesMessage) -> None:
         """Update device state with a thing.properties message.
 
-        For mower devices the properties are stored as ``mqtt_properties`` on the
-        device (unchanged behaviour).  For device types whose reducer overrides
-        :meth:`StateReducer.apply_properties` (currently :class:`RTKStateReducer`),
-        the JSON payloads are also unpacked into typed model fields so the state
-        machine remains the single source of truth.
+        The reducer unpacks known JSON payloads into typed model fields so the
+        state machine remains the single source of truth. The raw envelope is
+        still stored as ``mqtt_properties`` for subscribers that need it.
         """
-        # Let the reducer extract any typed fields it knows about (no-op for mowers).
+        old_battery = self._device_battery_value(self.state_machine.current.raw)
         device_with_props = self._reducer.apply_properties(self.state_machine.current.raw, properties)
+        new_battery = self._device_battery_value(device_with_props)
+        items = getattr(getattr(properties, "params", None), "items", None)
+        if (
+            getattr(items, "batteryPercentage", None) is not None
+            and old_battery is not None
+            and new_battery is not None
+            and old_battery != new_battery
+        ):
+            self._record_battery_update(
+                device_with_props,
+                old_battery,
+                new_battery,
+                "thing.properties.batteryPercentage",
+                TransportType.CLOUD_ALIYUN,
+            )
+
         # Always persist the raw envelope so subscribers can inspect it.
         updated = dataclasses.replace(device_with_props, mqtt_properties=properties)
         snapshot, _ = self.state_machine.apply(updated, self._availability)
