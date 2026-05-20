@@ -180,8 +180,8 @@ async def test_send_raw_calls_set_rate_limited_on_429() -> None:
     mqtt.set_rate_limited.assert_called_once()
 
 
-async def test_send_raw_blocked_silently_when_already_rate_limited() -> None:
-    """send_raw must silently drop the send (not call transport.send) when already rate-limited."""
+async def test_send_raw_logs_when_already_rate_limited(caplog: pytest.LogCaptureFixture) -> None:
+    """send_raw must log every blocked send when already rate-limited."""
     handle = _make_handle()
     mqtt = _make_mqtt_transport()
     mqtt.is_rate_limited = True
@@ -192,6 +192,8 @@ async def test_send_raw_blocked_silently_when_already_rate_limited() -> None:
     mqtt.send.assert_not_awaited()
     # set_rate_limited must NOT be called again — the ban is already active.
     mqtt.set_rate_limited.assert_not_called()
+    assert "rate-limited" in caplog.text
+    assert "send blocked" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +229,9 @@ async def test_ble_transport_not_blocked_by_rate_limited_flag() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_send_raw_guard_does_not_call_set_rate_limited_again() -> None:
+async def test_send_raw_guard_does_not_call_set_rate_limited_again(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """If a transport is already rate-limited, send_raw must not call set_rate_limited() again."""
     handle = _make_handle()
     mqtt = _make_mqtt_transport()
@@ -241,3 +245,4 @@ async def test_send_raw_guard_does_not_call_set_rate_limited_again() -> None:
 
     mqtt.set_rate_limited.assert_not_called()
     mqtt.send.assert_not_awaited()
+    assert caplog.text.count("send blocked") == 3

@@ -359,8 +359,14 @@ class DeviceHandle:
         BLE transports are never rate-limited and are always allowed through.
         """
         if transport.transport_type != TransportType.BLE and transport.is_rate_limited:
+            remaining = getattr(transport, "_rate_limited_until", 0.0)
+            if isinstance(remaining, (int, float)):
+                remaining = max(0.0, remaining - time.monotonic())
+                detail = f" for {remaining:.0f}s more"
+            else:
+                detail = ""
             raise TransportRateLimitedError(
-                f"Transport {transport.transport_type.value} is rate-limited — send blocked"
+                f"Transport {transport.transport_type.value} is rate-limited{detail} — send blocked"
             )
 
         last = transport.last_send_monotonic
@@ -1252,8 +1258,8 @@ class DeviceHandle:
         _logger.debug("send_raw '%s': sending via %s", self.device_name, transport.transport_type.value)
         try:
             await self._send_marked(transport, payload)
-        except TransportRateLimitedError:
-            _logger.debug("send_raw '%s': transport rate-limited — send blocked", self.device_name)
+        except TransportRateLimitedError as exc:
+            _logger.error("send_raw '%s': %s", self.device_name, exc)
         except TooManyRequestsException:
             _logger.warning("send_raw '%s': rate limited by cloud — blocking MQTT sends for 12h", self.device_name)
             transport.set_rate_limited()
