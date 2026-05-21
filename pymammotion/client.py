@@ -2086,6 +2086,15 @@ class MammotionClient:
                 lambda: handle.send_raw(command_bytes, prefer_ble=_prefer_ble),
                 _session,
             )
+            if _log_send_failures:
+                _logger.warning(
+                    "send_command_with_args '%s': dispatched '%s' priority=%s prefer_ble=%s kwargs=%s",
+                    name,
+                    key,
+                    getattr(_priority, "name", _priority),
+                    _prefer_ble,
+                    kwargs,
+                )
 
         await handle.queue.enqueue(_do_send, priority=_priority)
 
