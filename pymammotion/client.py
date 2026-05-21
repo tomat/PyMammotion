@@ -2279,6 +2279,8 @@ class MammotionClient:
         prefer_ble: bool = False,
         skip_if_saga_active: bool = False,
         _record_cmd: bool = True,
+        _priority: Priority = Priority.NORMAL,
+        _log_failures: bool = False,
         **kwargs: Any,
     ) -> None:
         """Send a named command to the device via the command queue.
@@ -2301,6 +2303,10 @@ class MammotionClient:
             _record_cmd:         Internal flag — set False for watchdog-initiated sends
                                  so they do not stamp _last_user_command_ts and
                                  inadvertently lock the watchdog into the 60 s window.
+            _priority:           Command queue priority. Emergency commands bypass saga
+                                 and transport reconnect gates.
+            _log_failures: Log operational failures that are normally quiet
+                           because callers are waiting for a visible user action.
 
         Raises:
             KeyError:       if *name* is not a registered device.
@@ -2316,13 +2322,15 @@ class MammotionClient:
         commands = handle.commands
         command_bytes: bytes = getattr(commands, key)(**kwargs)
         _logger.debug(
-            "send_command_with_args: device=%s key=%s prefer_ble=%s kwargs=%s",
+            "send_command_with_args: device=%s key=%s prefer_ble=%s priority=%s kwargs=%s",
             name,
             key,
             prefer_ble,
+            getattr(_priority, "name", _priority),
             kwargs,
         )
         _prefer_ble = prefer_ble
+        _log_send_failures = _log_failures
         _session = self._get_session_for_device(name)
 
         async def _do_send() -> None:
@@ -2337,8 +2345,9 @@ class MammotionClient:
             # naturally re-arm the poll loop, and the user can re-issue the
             # command then.
             if not handle.has_usable_transport:
-                _logger.debug(
-                    "send_command_with_args '%s': no usable transport — skipping '%s'",
+                log = _logger.warning if _log_send_failures else _logger.debug
+                log(
+                    "send_command_with_args '%s': no usable transport - skipping '%s'",
                     name,
                     key,
                 )
@@ -2348,7 +2357,11 @@ class MammotionClient:
                 _session,
             )
 
-        await handle.queue.enqueue(_do_send, priority=Priority.NORMAL, skip_if_saga_active=skip_if_saga_active)
+        await handle.queue.enqueue(
+            _do_send,
+            priority=_priority,
+            skip_if_saga_active=skip_if_saga_active,
+        )
 
     async def send_command_and_wait(
         self,
