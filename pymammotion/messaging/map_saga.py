@@ -63,6 +63,8 @@ class MapFetchSaga(Saga):
         send_command: Callable[[bytes], Awaitable[None]],
         get_map: Callable[[], HashList],
         sync_type: int = 3,
+        area_names_only: bool = False,
+        existing_area_hashes: list[int] | None = None,
     ) -> None:
         """Initialise the saga with device info and transport helpers.
 
@@ -70,6 +72,10 @@ class MapFetchSaga(Saga):
         ``lambda: handle.snapshot.raw.map``).  The saga never creates its
         own HashList — it operates directly on the device state so that
         partial data is preserved across retries without any extra bookkeeping.
+
+        When *area_names_only* is True the saga only refreshes area names and
+        skips the expensive hash-list and chunk fetches. *existing_area_hashes*
+        supplies fallback area IDs if the device has no saved area names.
         """
         self._device_id = device_id
         self._device_name = device_name
@@ -78,6 +84,8 @@ class MapFetchSaga(Saga):
         self._send_command = send_command
         self._get_map = get_map
         self._sync_type = sync_type  # 2 = BLE, 3 = IoT/MQTT
+        self._area_names_only = area_names_only
+        self._existing_area_hashes: list[int] = existing_area_hashes or []
 
         # Result — set on success, None until then
         self.result: HashList | None = None
@@ -115,7 +123,22 @@ class MapFetchSaga(Saga):
                 self._get_map().area_name = [
                     AreaHashNameList(name=item.name, hash=item.hash) for item in area_hash_name_msg.hashnames
                 ]
+            elif self._existing_area_hashes:
+                self._get_map().area_name = [
+                    AreaHashNameList(name=f"area {i + 1}", hash=h)
+                    for i, h in enumerate(sorted(self._existing_area_hashes))
+                ]
+                _logger.debug(
+                    "MapFetchSaga[%s]: device returned no area names - generated %d fallback name(s)",
+                    self._device_name,
+                    len(self._get_map().area_name),
+                )
             _logger.debug("MapFetchSaga[%s]: got %d area names", self._device_name, len(self._get_map().area_name))
+
+        if self._area_names_only:
+            _logger.debug("MapFetchSaga[%s]: area-names-only mode - skipping hash list fetch", self._device_name)
+            self.result = self._get_map()
+            return
 
         # ------------------------------------------------------------------
         # Steps 2-3: Root hash list frames.

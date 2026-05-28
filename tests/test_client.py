@@ -1508,14 +1508,12 @@ async def test_add_ble_only_device_with_ble_device_disables_self_managed_scannin
 
 
 # ---------------------------------------------------------------------------
-# MQTT loop respects offline state — never polls when no transport is usable
+# MQTT loop can probe over connected MQTT to recover a stale offline latch
 # ---------------------------------------------------------------------------
 
 
-async def test_poll_loop_never_polls_when_device_reported_offline_and_no_ble() -> None:
-    """When the cloud has reported the device offline AND no BLE is registered,
-    the MQTT loop must never call _send_one_shot_report — it should only sleep.
-    """
+async def test_poll_loop_probes_when_connected_mqtt_reported_offline_and_no_ble() -> None:
+    """Connected MQTT may probe to recover a stale mqtt_reported_offline latch."""
     from pymammotion.state.device_state import DeviceAvailability
 
     handle = make_handle("dev1", "Luba-Offline")
@@ -1546,9 +1544,9 @@ async def test_poll_loop_never_polls_when_device_reported_offline_and_no_ble() -
     ):
         await asyncio.wait_for(mqtt_activity_loop(handle), timeout=2.0)
 
-    # The loop must have looped — we forced 5 sleeps — and never sent a poll.
+    # The loop must have looped — we forced 5 sleeps — and sent a recovery probe.
     assert sleep_count >= iteration_cap
-    one_shot_mock.assert_not_awaited()
+    one_shot_mock.assert_awaited()
 
 
 async def test_poll_loop_resumes_after_mqtt_offline_clears() -> None:
@@ -1633,8 +1631,8 @@ async def test_poll_loop_skips_when_ble_only_in_cooldown_and_no_mqtt() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_has_usable_transport_false_when_offline_and_no_ble() -> None:
-    """has_usable_transport mirrors active_transport: False when MQTT offline + no BLE."""
+async def test_has_usable_transport_true_when_connected_mqtt_offline_and_no_ble() -> None:
+    """Connected MQTT is usable for probing a stale offline latch."""
     from pymammotion.state.device_state import DeviceAvailability
 
     handle = make_handle("dev1", "Luba-NoTransport")
@@ -1646,7 +1644,7 @@ async def test_has_usable_transport_false_when_offline_and_no_ble() -> None:
         mqtt_reported_offline=True,
     )
 
-    assert handle.has_usable_transport is False
+    assert handle.has_usable_transport is True
 
 
 async def test_has_usable_transport_true_when_mqtt_usable() -> None:
@@ -1678,8 +1676,8 @@ async def test_has_usable_transport_false_when_ble_unusable_and_no_mqtt() -> Non
     assert handle.has_usable_transport is False
 
 
-async def test_send_command_with_args_skips_immediately_when_offline() -> None:
-    """Offline + no usable transport → debug log, no enqueue retry, no hang."""
+async def test_send_command_with_args_probes_connected_mqtt_when_offline() -> None:
+    """Offline latch + connected MQTT still sends once so the latch can recover."""
     from pymammotion.state.device_state import DeviceAvailability
 
     client = MammotionClient()
@@ -1711,8 +1709,8 @@ async def test_send_command_with_args_skips_immediately_when_offline() -> None:
 
     # No retry loop ⇒ no 2.0s sleeps fired by send_command_with_args.
     assert all(d != 2.0 for d in sleep_calls), f"unexpected retry sleep: {sleep_calls}"
-    # And no actual send went out.
-    mqtt.send.assert_not_awaited()
+    # Connected MQTT is still allowed to carry one recovery probe.
+    mqtt.send.assert_awaited_once()
 
 
 async def test_queue_logs_no_transport_at_debug_not_warning(caplog: pytest.LogCaptureFixture) -> None:
@@ -1767,6 +1765,11 @@ async def test_has_usable_transport_true_when_offline_with_ble_usable_but_discon
     assert ble.is_usable is True
     assert handle.has_usable_transport is True
 
-    # Sanity: flipping ble.is_usable=False (cooldown) flips the property too.
+    # Sanity: flipping ble.is_usable=False still leaves connected MQTT usable
+    # for a stale-offline recovery probe.
     ble.is_usable = False
+    assert handle.has_usable_transport is True
+
+    # If MQTT is also disconnected, nothing remains usable.
+    mqtt.is_connected = False
     assert handle.has_usable_transport is False

@@ -1796,6 +1796,18 @@ class MammotionClient:
 
         if handle := self._device_registry.get_by_name(device_name):
             commands = handle.commands
+            # MQTT-only gate: when full_map_fetch_enabled is False AND BLE is not
+            # actively connected (so this would go over MQTT), downgrade to
+            # area-names-only mode. BLE-routed syncs always run the full fetch.
+            mqtt_only_run = not handle.is_transport_connected(TransportType.BLE)
+            area_names_only = mqtt_only_run and not handle.full_map_fetch_enabled
+            existing_area_hashes: list[int] | None = None
+            if area_names_only:
+                existing_area_hashes = sorted(cast(MowerDevice, handle.snapshot.raw).map.area.keys())
+                _logger.debug(
+                    "start_map_sync '%s': full_map_fetch_enabled=False over MQTT - area-names-only mode",
+                    device_name,
+                )
             saga = MapFetchSaga(
                 device_id=handle.device_id,
                 device_name=handle.device_name,
@@ -1804,6 +1816,8 @@ class MammotionClient:
                 send_command=handle.send_raw,
                 get_map=lambda: cast(MowerDevice, handle.snapshot.raw).map,
                 sync_type=2 if handle.is_transport_connected(TransportType.BLE) else 3,
+                area_names_only=area_names_only,
+                existing_area_hashes=existing_area_hashes,
             )
 
             async def _on_map_complete() -> None:
@@ -2436,6 +2450,16 @@ class MammotionClient:
         handle = self._device_registry.get(device_id)
         if handle is not None:
             handle.set_mow_path_fetch_enabled(value=enabled)
+
+    def set_full_map_fetch_enabled(self, device_id: str, *, enabled: bool) -> None:
+        """Toggle the MQTT-side full map fetch gate for a registered device.
+
+        When False, MapFetchSaga over MQTT runs in area-names-only mode.
+        BLE-routed map syncs always run the full fetch regardless.
+        """
+        handle = self._device_registry.get(device_id)
+        if handle is not None:
+            handle.set_full_map_fetch_enabled(value=enabled)
 
     # ------------------------------------------------------------------
     # Properties

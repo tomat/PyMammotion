@@ -164,6 +164,36 @@ async def test_map_saga_fetches_area_names_for_non_luba1() -> None:
     assert first_call_kwargs["expected_field"] == "toapp_all_hash_name"
 
 
+async def test_map_saga_area_names_only_skips_hash_fetch_and_generates_fallbacks() -> None:
+    """Area-names-only mode refreshes names without running the expensive map fetch."""
+    broker = AsyncMock(spec=DeviceMessageBroker)
+    builder = _make_command_builder()
+    broker.send_and_wait.return_value = _make_area_name_response([])
+    device_map = HashList()
+
+    with patch("betterproto2.which_one_of", side_effect=_which_one_of_for_hash):
+        saga = MapFetchSaga(
+            device_id="dev-001",
+            device_name="LUBA2",
+            is_luba1=False,
+            command_builder=builder,
+            send_command=AsyncMock(),
+            get_map=lambda: device_map,
+            area_names_only=True,
+            existing_area_hashes=[300, 100],
+        )
+        await saga.execute(broker)
+
+    assert saga.result is device_map
+    assert [(area.hash, area.name) for area in device_map.area_name] == [
+        (100, "area 1"),
+        (300, "area 2"),
+    ]
+    builder.get_area_name_list.assert_called_once_with("dev-001")
+    builder.get_all_boundary_hash_list.assert_not_called()
+    broker.subscribe_unsolicited.assert_not_called()
+
+
 async def test_map_saga_skips_area_names_for_luba1() -> None:
     """For Luba1 devices, get_area_name_list must NOT be called."""
     broker = AsyncMock(spec=DeviceMessageBroker)
