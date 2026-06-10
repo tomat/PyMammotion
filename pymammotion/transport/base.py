@@ -7,6 +7,7 @@ import collections
 import contextlib
 from enum import Enum
 import logging
+import socket
 import time
 from typing import TYPE_CHECKING, Generic, Self, TypeVar
 
@@ -14,7 +15,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from pymammotion.data.mqtt.event import ThingEventMessage
-    from pymammotion.data.mqtt.properties import ThingPropertiesMessage
+    from pymammotion.data.mqtt.properties import MammotionPropertiesMessage, ThingPropertiesMessage
     from pymammotion.data.mqtt.status import ThingStatusMessage
 
 _logger = logging.getLogger(__name__)
@@ -61,6 +62,16 @@ class ReLoginRequiredError(AuthError):
         super().__init__(f"Re-login required for account '{account_id}': {reason}")
 
 
+class AccountInUseError(ReLoginRequiredError):
+    """The Aliyun account is already active in another session (distributed lock held).
+
+    Code 2152 / "distributed lock failed" from the broker means another app or
+    device has an exclusive session lock on this account.  Re-login will not help
+    until the other session releases the lock or times out.  HA-Luba should catch
+    this separately and surface a user-visible message rather than silently retrying.
+    """
+
+
 class LoginFailedError(AuthError):
     """Full re-login with stored credentials failed; user must reconfigure."""
 
@@ -69,6 +80,34 @@ class LoginFailedError(AuthError):
         self.account_id = account_id
         self.reason = reason
         super().__init__(f"Login failed for account '{account_id}': {reason}")
+
+
+def is_transient_network_error(exc: BaseException) -> bool:
+    """Return True if *exc* is a transient connectivity failure rather than an auth one.
+
+    Covers DNS resolution failures, connection refused/timeout, and any OSError
+    socket-class error indicating the network is down.  These must NOT be
+    wrapped as ``ReLoginRequiredError`` — doing so triggers a destructive full
+    re-login in the MQTT transport fatal-auth handler, which itself fails the
+    same way and leaves the integration looping.  Let them propagate as their
+    original type so the connection loop's existing exponential-backoff catch
+    handles them.
+
+    Recognises:
+      * ``socket.gaierror``                  — DNS resolution failure
+      * ``ConnectionError`` / ``TimeoutError`` — generic connection failures
+      * ``OSError``                          — broader socket-level errors
+      * ``aiohttp.ClientConnectorError`` and subclasses, by class name (so we
+        don't introduce a hard runtime dep on aiohttp from this module)
+      * The ``__cause__`` chain for any of the above (aiohttp wraps OSError)
+    """
+    if isinstance(exc, (socket.gaierror, ConnectionError, TimeoutError, OSError)):
+        return True
+    name = type(exc).__name__
+    if name in {"ClientConnectorError", "ClientConnectorDNSError", "ClientConnectorCertificateError"}:
+        return True
+    cause = exc.__cause__
+    return cause is not None and isinstance(cause, (socket.gaierror, OSError, ConnectionError, TimeoutError))
 
 
 class NoBLEAddressKnownError(TransportError):
@@ -213,6 +252,9 @@ class Transport(ABC):
     #: Called when a thing.properties message arrives (iot_id, properties).
     on_device_properties: Callable[[str, ThingPropertiesMessage], Awaitable[None]] | None = None
 
+    #: Called when a Mammotion MQTT flat property/post message arrives (iot_id, properties).
+    on_device_mammotion_properties: Callable[[str, MammotionPropertiesMessage], Awaitable[None]] | None = None
+
     #: Duration of the rate-limit ban in seconds (12 hours).
     _RATE_LIMIT_DURATION: float = 43200.0
     #: Rolling window for the outbound send counter (24 hours).
@@ -235,6 +277,12 @@ class Transport(ABC):
         #: Set by mark_auth_failed() when a send fails with ReLoginRequiredError.
         #: Cleared by clear_auth_failed() after successful credential recovery.
         self._auth_failed: bool = False
+        #: Set by mark_unrecoverable_auth_failure() when the re-login circuit
+        #: breaker trips.  Unlike _auth_failed, this is a permanent state — the
+        #: transport's connect() must refuse to start a new receive loop, and
+        #: is_usable stays False until something explicitly clears it.  The
+        #: integration host (HA) is expected to initiate a reauth flow.
+        self._unrecoverable_auth_failure: bool = False
 
     @property
     def on_message(self) -> Callable[[bytes], Awaitable[None]] | None:
@@ -323,10 +371,16 @@ class Transport(ABC):
         """True when this transport is in a state where ``send()`` could plausibly succeed.
 
         Returns False when an auth failure has been recorded via
-        :meth:`mark_auth_failed`.  :class:`~pymammotion.transport.ble.BLETransport`
-        overrides this to add BLEDevice-presence and cooldown gating.
+        :meth:`mark_auth_failed` or :meth:`mark_unrecoverable_auth_failure`.
+        :class:`~pymammotion.transport.ble.BLETransport` overrides this to add
+        BLEDevice-presence and cooldown gating.
         """
-        return not self._auth_failed
+        return not self._auth_failed and not self._unrecoverable_auth_failure
+
+    @property
+    def is_unrecoverable_auth_failure(self) -> bool:
+        """True after the re-login circuit breaker has tripped on this transport."""
+        return self._unrecoverable_auth_failure
 
     def set_rate_limited(self) -> None:
         """Record a rate-limit event; blocks sends on this transport for _RATE_LIMIT_DURATION seconds."""
@@ -377,6 +431,16 @@ class Transport(ABC):
         """Clear the auth-failed flag after successful credential recovery."""
         self._auth_failed = False
 
+    def mark_unrecoverable_auth_failure(self) -> None:
+        """Mark this transport as permanently failed — the re-login circuit breaker tripped.
+
+        Concrete transports must check this in ``connect()`` and refuse to spawn
+        a new receive loop while set; otherwise stale ``call_soon(connect())``
+        callbacks (scheduled by an earlier ``_on_fatal_auth`` cycle) will keep
+        restarting the loop after the breaker has decided to give up.
+        """
+        self._unrecoverable_auth_failure = True
+
     @abstractmethod
     async def connect(self) -> None:
         """Establish the connection. Raises TransportError or AuthError on failure."""
@@ -386,7 +450,7 @@ class Transport(ABC):
         """Gracefully close the connection."""
 
     @abstractmethod
-    async def send(self, payload: bytes, iot_id: str = "") -> None:
+    async def send(self, payload: bytes, iot_id: str = "", firmware_version: str = "1.0.0.0") -> None:
         """Send a raw payload. Raises TransportError if not connected."""
 
     async def send_heartbeat(self, payload: bytes, iot_id: str = "") -> None:

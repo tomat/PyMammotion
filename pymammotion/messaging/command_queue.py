@@ -10,7 +10,7 @@ import logging
 import time
 from typing import TYPE_CHECKING
 
-from pymammotion.aliyun.exceptions import DeviceOfflineException, TooManyRequestsException
+from pymammotion.aliyun.exceptions import DeviceOfflineException, DeviceUnboundException, TooManyRequestsException
 from pymammotion.transport import TransportError
 from pymammotion.transport.base import (
     AuthError,
@@ -271,12 +271,11 @@ class DeviceCommandQueue:
                     except GatewayTimeoutException:
                         if _attempt < _gateway_timeout_max:
                             _logger.warning(
-                                "DeviceCommandQueue[%s]: gateway timeout (attempt %d/%d) — retrying in 1s",
+                                "DeviceCommandQueue[%s]: gateway timeout (attempt %d/%d) — retrying",
                                 self._device_name,
                                 _attempt,
                                 _gateway_timeout_max,
                             )
-                            await asyncio.sleep(1.0)
                         else:
                             _logger.warning(
                                 "DeviceCommandQueue[%s]: gateway timeout after %d attempts — dropping command",
@@ -292,12 +291,9 @@ class DeviceCommandQueue:
                 # is automatic: mqtt_reported_offline clears on inbound frames,
                 # BLE rearms via the availability listener.  No retry loop or
                 # caller-side gate needed; just don't pollute the log.
-                if isinstance(exc, (NoTransportAvailableError, DeviceOfflineException)):
+                if isinstance(exc, (NoTransportAvailableError, DeviceOfflineException, DeviceUnboundException)):
                     _logger.debug("DeviceCommandQueue[%s]: %s", self._device_name, exc)
-                elif isinstance(exc, ReLoginRequiredError):
-                    _logger.warning("DeviceCommandQueue[%s]: %s", self._device_name, exc)
-                # Real warnings — auth, saga, rate-limit, generic transport.
-                elif isinstance(
+                elif isinstance(exc, ReLoginRequiredError) or isinstance(
                     exc,
                     (
                         AuthError,

@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from bleak import BleakScanner
 from bleak.exc import BleakError
-from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
+from bleak_retry_connector import BleakClientWithServiceCache, BleakOutOfConnectionSlotsError, establish_connection
 
 from pymammotion.bluetooth.ble_message import BleMessage
 from pymammotion.bluetooth.const import UUID_NOTIFICATION_CHARACTERISTIC
@@ -53,6 +53,12 @@ class BLETransportConfig:
         connect_cooldown_seconds: How long to refuse new connect attempts after
             the failure threshold trips.  Advertisement pushes still update the
             cached BLEDevice but ``is_usable`` stays False until cooldown expires.
+        min_rssi: Weakest advertisement RSSI (dBm) the transport will still
+            consider usable.  When the last reported RSSI is below this, a GATT
+            connection is unlikely to succeed, so ``is_usable`` returns False and
+            routing falls back to MQTT until a stronger advertisement arrives.
+            RSSI is only checked when it is known (pushed via
+            :meth:`BLETransport.set_ble_device`); an unknown RSSI never gates.
 
     """
 
@@ -60,8 +66,9 @@ class BLETransportConfig:
     ble_address: str | None = None
     self_managed_scanning: bool = False
     scan_timeout: float = 10.0
-    connect_failure_threshold: int = 3
-    connect_cooldown_seconds: float = 60.0
+    connect_failure_threshold: int = 1
+    connect_cooldown_seconds: float = 120.0
+    min_rssi: int = -80
 
 
 class BLETransport(Transport):
@@ -104,12 +111,15 @@ class BLETransport(Transport):
         #: ``time.monotonic()`` deadline before another connect attempt is allowed.
         #: 0.0 when no cooldown is active.
         self._connect_cooldown_until: float = 0.0
+        #: Last advertisement RSSI (dBm) pushed via ``set_ble_device``.  ``None``
+        #: until a caller supplies one — an unknown RSSI never gates ``is_usable``.
+        self._last_rssi: int | None = None
 
     # ------------------------------------------------------------------
     # Public device management
     # ------------------------------------------------------------------
 
-    def set_ble_device(self, device: BLEDevice) -> bool:
+    def set_ble_device(self, device: BLEDevice, rssi: int | None = None) -> bool:
         """Supply (or update) the bleak BLEDevice used for the next connect().
 
         Always swaps the cached pointer so ``bleak_retry_connector``'s
@@ -117,6 +127,14 @@ class BLETransport(Transport):
         Does NOT reset ``_consecutive_failures`` or the cooldown — a stream of
         advertisements doesn't prove the link can connect; only a successful
         ``connect()`` or an explicit ``clear_ble_device()`` does.
+
+        Args:
+            device: The freshest bleak ``BLEDevice`` from the advertisement.
+            rssi: Optional advertisement RSSI (dBm).  bleak 3.x carries RSSI on
+                the ``AdvertisementData``, not the ``BLEDevice``, so callers that
+                have it must pass it here for the weak-signal gate in
+                :attr:`is_usable` to take effect.  ``None`` leaves the last known
+                RSSI untouched.
 
         Returns:
             ``True`` if the cached BLE address actually changed (or this is the
@@ -127,6 +145,8 @@ class BLETransport(Transport):
         previous_address: str | None = self._ble_device.address if self._ble_device is not None else None
         new_address: str = device.address
         self._ble_device = device
+        if rssi is not None:
+            self._last_rssi = rssi
         return previous_address != new_address
 
     def clear_ble_device(self) -> None:
@@ -141,6 +161,7 @@ class BLETransport(Transport):
         self._ble_device = None
         self._consecutive_failures = 0
         self._connect_cooldown_until = 0.0
+        self._last_rssi = None
 
     @property
     def ble_address(self) -> str | None:
@@ -149,7 +170,7 @@ class BLETransport(Transport):
 
     @property
     def is_usable(self) -> bool:
-        """True when this transport has a BLEDevice and isn't in connect-cooldown.
+        """True when this transport has a BLEDevice, a workable signal, and isn't in cooldown.
 
         ``DeviceHandle.active_transport()`` reads this to decide whether to
         consider BLE for routing.  An "unusable" transport stays registered
@@ -157,8 +178,15 @@ class BLETransport(Transport):
         skipped over until it becomes usable again — either by an
         advertisement-driven ``set_ble_device()`` plus cooldown expiry, or
         by an explicit ``clear_ble_device()`` followed by ``set_ble_device()``.
+
+        A known RSSI below ``config.min_rssi`` also marks the transport
+        unusable: the advertisement is audible but too weak to establish a
+        reliable GATT link, so routing falls back to MQTT until a stronger
+        advertisement arrives.  An unknown RSSI (never pushed) does not gate.
         """
         if self._ble_device is None:
+            return False
+        if self._last_rssi is not None and self._last_rssi < self._config.min_rssi:
             return False
         return super().is_usable and time.monotonic() >= self._connect_cooldown_until
 
@@ -251,12 +279,14 @@ class BLETransport(Transport):
                     self._ble_device,
                     self._config.device_id,
                     self._handle_disconnect,
-                    max_attempts=1,
-                    ble_device_callback=lambda: self._ble_device,  # type: ignore[arg-type,return-value]
+                    use_services_cache=True,
+                    timeout=2,
+                    max_attempts=2,
+                    ble_device_callback=lambda: self._ble_device,  # type: ignore
                 )
             except BleakError as exc:
                 await self._notify_availability(TransportAvailability.DISCONNECTED)
-                self._record_connect_failure()
+                self._record_connect_failure(exc)
                 raise BLEUnavailableError(f"BLE connection failed for {self._config.device_id!r}: {exc}") from exc
 
             self._message = BleMessage(self._client)
@@ -291,25 +321,37 @@ class BLETransport(Transport):
             # DeviceHandle._keep_alive_loop (20 s).
             await self._ble_sync()
 
-    def _record_connect_failure(self) -> None:
-        """Increment the failure counter; at threshold, clear device and start cooldown.
+    def _record_connect_failure(self, exc: BleakError | None = None) -> None:
+        """Increment the failure counter; clear device and start cooldown at threshold.
 
-        We deliberately *clear the cached BLEDevice* on threshold trip even
-        though HA will keep pushing fresh advertisements.  The cooldown timer
-        still gates ``is_usable``, but clearing the device makes the next
-        ``connect()`` raise ``NoBLEAddressKnownError`` (or trigger a fresh
-        scan in self-managed mode) once the cooldown lapses — guaranteeing the
-        retry uses a fresh BLEDevice rather than a stale pointer that already
-        failed.
+        A :class:`BleakOutOfConnectionSlotsError` (the proxy/adapter is out of
+        connection slots, or the device is no longer reachable) trips the cooldown
+        **immediately**, bypassing the consecutive-failure threshold: an immediate
+        retry cannot succeed — there is no free slot and the device may be out of
+        range — so we drive ``is_usable`` False right away.  The handle's send paths
+        already skip BLE (falling through to MQTT) while a transport is unusable, so
+        this turns a per-send "BLE unavailable — falling back to MQTT" churn into a
+        single attempt followed by quiet MQTT use until BLE is reachable again.
+        After the cooldown lapses, the next advertisement re-arms a single retry.
+
+        We deliberately *clear the cached BLEDevice* on trip even though HA will keep
+        pushing fresh advertisements.  The cooldown timer still gates ``is_usable``,
+        but clearing the device makes the next ``connect()`` raise
+        ``NoBLEAddressKnownError`` (or trigger a fresh scan in self-managed mode) once
+        the cooldown lapses — guaranteeing the retry uses a fresh BLEDevice rather
+        than a stale pointer that already failed.
         """
+        immediate = isinstance(exc, BleakOutOfConnectionSlotsError)
         self._consecutive_failures += 1
-        if self._consecutive_failures < self._config.connect_failure_threshold:
+        if not immediate and self._consecutive_failures < self._config.connect_failure_threshold:
             return
         self._connect_cooldown_until = time.monotonic() + self._config.connect_cooldown_seconds
         _logger.info(
-            "BLETransport[%s]: %d consecutive connect failures — cooling down for %.0fs",
+            "BLETransport[%s]: %s — cooling down for %.0fs (is_usable now False; sends use MQTT)",
             self._config.device_id,
-            self._consecutive_failures,
+            "out of connection slots / device unreachable"
+            if immediate
+            else f"{self._consecutive_failures} consecutive connect failures",
             self._config.connect_cooldown_seconds,
         )
         # Reset counter so the next post-cooldown attempt starts a fresh tally.
@@ -354,7 +396,10 @@ class BLETransport(Transport):
     async def disconnect(self) -> None:
         """Gracefully disconnect the BLE client."""
         if self._client is not None and self._client.is_connected:
-            await self._client.disconnect()
+            try:
+                await self._client.disconnect()
+            except BleakError as exc:
+                _logger.warning("BLETransport[%s]: failed to disconnect: %s", self._config.device_id, exc)
         self._client = None
         self._message = None
         self.clear_ble_device()
@@ -389,7 +434,7 @@ class BLETransport(Transport):
                     f"BLE send failed for {self._config.device_id!r}: client disconnected during write"
                 )
 
-    async def send(self, payload: bytes, iot_id: str = "") -> None:
+    async def send(self, payload: bytes, iot_id: str = "", firmware_version: str = "1.0.0.0") -> None:
         """Frame and write payload via the BleMessage codec."""
         _logger.debug("Sending BLE payload: %s, %s iot_id", payload, iot_id)
         self._last_send_monotonic = time.monotonic()
@@ -453,7 +498,7 @@ class BLETransport(Transport):
         if self._message is None:
             return
 
-        result = self._message.parseNotification(data)
+        result = self._message.parseNotification(bytes(data))
         if result != 0:
             # result == 1  → fragment received, waiting for more
             # result == 2  → duplicate sequence, already processed
@@ -471,7 +516,7 @@ class BLETransport(Transport):
     # ------------------------------------------------------------------
 
     async def _ble_sync(self) -> None:
-        """Send a one-shot ``todev_ble_sync(2)`` packet.
+        """Send a one-shot sync packet.
 
         Fired on connect (and as a courtesy on clean disconnect).  Periodic
         heartbeats are driven by ``DeviceHandle._keep_alive_loop`` (20 s).

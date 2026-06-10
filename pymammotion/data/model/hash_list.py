@@ -1,14 +1,21 @@
+"""Hash-keyed map data model: frame lists, area/obstacle/path storage, and HashList."""
+
+from __future__ import annotations
+
+import dataclasses
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from mashumaro.mixins.orjson import DataClassORJSONMixin
 from shapely import Point
 
-from pymammotion.data.model.location import Dock, LocationPoint
 from pymammotion.proto import NavGetCommDataAck, NavGetHashListAck, SvgMessageAckT
 from pymammotion.utility.map import CoordinateConverter
 from pymammotion.utility.mur_mur_hash import MurMurHashUtil
+
+if TYPE_CHECKING:
+    from pymammotion.data.model.location import Dock, LocationPoint
 
 
 class PathType(IntEnum):
@@ -50,6 +57,22 @@ class PathType(IntEnum):
 
     VIRTUAL_WALL = 21
     """User-drawn virtual fence / keep-out line."""
+
+    NO_GO_ZONE_VARIANT = 22
+    """Sibling of NO_GO_ZONE (23).  Both encode as ``(shape=0, type=1)`` in
+    ``ManualElementMessage`` and are grouped with the user-drawn manual
+    elements (21/22/23/24/25) in APK ``AreaDBHelper.deleteMapElementDB231``.
+    The exact distinction from NO_GO_ZONE isn't visible in the decompiled
+    APK — one variant is likely vision-detected (mirroring the 25/26
+    safe/visual-obstacle split) but this isn't confirmed.  Stored separately
+    in ``HashList.no_go_zone_variant`` so the two aren't conflated.
+    """
+
+    NO_GO_ZONE = 23
+    """User-drawn rectangular no-go zone (APK: ``updateNoGoZone`` /
+    ``rectangularRestrictedPoint``).  Observed on LUBA_VA — siblings are
+    21 (virtual wall line), 25 (safe rectangle), 26 (visual obstacle zone).
+    """
 
     VISUAL_SAFETY_ZONE = 25
     """Vision-detected safety zone (Luba 2 Vision / Pro only)."""
@@ -98,7 +121,7 @@ class NavGetCommData(DataClassORJSONMixin):
     current_frame: int = 0
     data_hash: int = 0
     data_len: int = 0
-    data_couple: list["CommDataCouple"] = field(default_factory=list)
+    data_couple: list[CommDataCouple] = field(default_factory=list)
     reserved: str = ""
     name_time: NavNameTime = field(default_factory=NavNameTime)
 
@@ -112,7 +135,7 @@ class MowPathPacket(DataClassORJSONMixin):
     path_total: int = 0
     path_cur: int = 0
     zone_hash: int = 0
-    data_couple: list["CommDataCouple"] = field(default_factory=list)
+    data_couple: list[CommDataCouple] = field(default_factory=list)
 
 
 @dataclass
@@ -166,7 +189,7 @@ class SvgMessage(DataClassORJSONMixin):
     paternal_hash_a: int = 0
     type: int = 0
     result: int = 0
-    svg_message: "SvgMessageData" = field(default_factory=SvgMessageData)
+    svg_message: SvgMessageData = field(default_factory=SvgMessageData)
 
 
 @dataclass
@@ -175,7 +198,27 @@ class FrameList(DataClassORJSONMixin):
 
     total_frame: int = 0
     sub_cmd: int = 0
-    data: list[NavGetCommData | SvgMessage] = field(default_factory=list)
+    data: list[NavGetCommData] = field(default_factory=list)
+
+    @property
+    def name(self) -> str:
+        """Return name_time.name from the first data frame, or empty string if absent."""
+        if self.data:
+            return self.data[0].name_time.name
+        return ""
+
+
+@dataclass
+class SvgFrameList(DataClassORJSONMixin):
+    """Accumulates SvgMessage frames for a single SVG tile hash.
+
+    Stored separately from FrameList so mashumaro can deserialize the
+    unambiguous ``list[SvgMessage]`` type without union discrimination.
+    """
+
+    total_frame: int = 0
+    sub_cmd: int = 0
+    data: list[SvgMessage] = field(default_factory=list)
 
 
 @dataclass
@@ -252,6 +295,43 @@ class Plan(DataClassORJSONMixin):
     toward_mode: int = 0
     toward_included_angle: int = 0
 
+    # --- enable / rename helpers -----------------------------------------
+    # ``reserved`` is an 8-byte buffer the device stores alongside the
+    # plan.  Byte 2 = enable flag (0/1); the other bytes carry settings
+    # encoded with a +10 offset (exact meaning not fully decoded —
+    # ``docs/tasks_and_schedules.md`` § 1.3).  For enable/rename/copy
+    # we round-trip the stored buffer verbatim and only mutate byte 2 so
+    # callers don't have to know the layout.
+    #
+    # All bytes the APK writes are < 128, so latin-1 round-trips
+    # losslessly between str and bytes.
+
+    def is_enabled(self) -> bool:
+        """Return True when the plan's enable flag (``reserved[2]``) is set.
+
+        Plans with a missing or short ``reserved`` buffer (e.g. legacy
+        firmware or freshly constructed Plan objects) default to enabled —
+        matching the APK's behaviour when the byte is absent.
+        """
+        raw = self.reserved.encode("latin-1") if self.reserved else b""
+        return raw[2] == 1 if len(raw) > 2 else True
+
+    def with_enabled(self, enabled: bool) -> Plan:
+        """Return a copy of this plan with ``reserved[2]`` set to *enabled*.
+
+        Bytes 0,1,3,4,5,6,7 are preserved verbatim from the existing
+        ``reserved`` buffer (or padded to 8 zero bytes when absent).
+        """
+        raw = bytearray(self.reserved.encode("latin-1") if self.reserved else b"")
+        if len(raw) < 8:
+            raw.extend(b"\x00" * (8 - len(raw)))
+        raw[2] = 1 if enabled else 0
+        return dataclasses.replace(self, reserved=raw.decode("latin-1"))
+
+    def with_renamed(self, new_name: str) -> Plan:
+        """Return a copy of this plan with ``task_name`` set to *new_name*."""
+        return dataclasses.replace(self, task_name=new_name)
+
 
 @dataclass(eq=False, repr=False)
 class NavGetHashListData(DataClassORJSONMixin):
@@ -299,7 +379,7 @@ class HashList(DataClassORJSONMixin):
     path: dict[int, FrameList] = field(default_factory=dict)  # type 2
     obstacle: dict[int, FrameList] = field(default_factory=dict)  # type 1
     dump: dict[int, FrameList] = field(default_factory=dict)  # type 12? / sub cmd 4
-    svg: dict[int, FrameList] = field(default_factory=dict)  # type 13
+    svg: dict[int, SvgFrameList] = field(default_factory=dict)  # type 13
     line: dict[int, FrameList] = field(
         default_factory=dict
     )  # type 10, sub cmd 3 — breakpoint line data, keyed by ub_path_hash
@@ -308,6 +388,8 @@ class HashList(DataClassORJSONMixin):
     corridor_line: dict[int, FrameList] = field(default_factory=dict)  # type 19
     corridor_point: dict[int, FrameList] = field(default_factory=dict)  # type 20
     virtual_wall: dict[int, FrameList] = field(default_factory=dict)  # type 21
+    no_go_zone_variant: dict[int, FrameList] = field(default_factory=dict)  # type 22
+    no_go_zone: dict[int, FrameList] = field(default_factory=dict)  # type 23
     plan: dict[str, Plan] = field(default_factory=dict)
     area_name: list[AreaHashNameList] = field(default_factory=list)
     current_mow_path: dict[int, dict[int, MowPath]] = field(default_factory=dict)
@@ -327,6 +409,45 @@ class HashList(DataClassORJSONMixin):
     """WGS-84 LineString of ``dynamics_line``, regenerated after each fetch."""
     generated_mow_progress_geojson: dict[str, Any] = field(default_factory=dict)
     """Completed portion of the planned mow path, sliced to ``now_index``."""
+
+    #: Fallback storage for frames whose ``type`` isn't in ``PathType`` (e.g.
+    #: radar-only types like 23 observed on LUBA_VA).  Keyed [type][hash].
+    #: ``find_incomplete_hashes`` consults this so an unknown-type hash isn't
+    #: forever flagged as missing and stalling ``MapFetchSaga``.
+    unknown_type_frames: dict[int, dict[int, FrameList]] = field(default_factory=dict)
+
+    #: Frozen snapshot of ``area_root_hashlist`` taken when ``generated_geojson``
+    #: was last built.  Used by ``geojson_needs_regeneration`` to short-circuit
+    #: the expensive feature-walk when the hashlist hasn't changed.
+    _geojson_hashlist_snapshot: frozenset[int] = field(default_factory=frozenset)
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> HashList:
+        """Deepcopy that shares the four ``generated_*_geojson`` dicts by reference.
+
+        These dicts can be MB-sized for large maps and are the dominant cost of
+        the per-frame ``copy.deepcopy(current.map)`` in ``MowerStateReducer.apply``.
+        They are ONLY ever replaced wholesale by the matching ``generate_*_geojson``
+        methods — never mutated in place — so sharing references across copies
+        is safe.
+        """
+        import copy as _copy
+
+        cls = self.__class__
+        new = cls.__new__(cls)
+        memo[id(self)] = new
+        shared_geojson = {
+            "generated_geojson",
+            "generated_mow_path_geojson",
+            "generated_mow_progress_geojson",
+            "generated_dynamics_line_geojson",
+        }
+        for f in dataclasses.fields(self):
+            value = getattr(self, f.name)
+            if f.name in shared_geojson:
+                object.__setattr__(new, f.name, value)
+            else:
+                object.__setattr__(new, f.name, _copy.deepcopy(value, memo))
+        return new
 
     def update_hash_lists(self, hashlist: list[int], bol_hash: int | None = None) -> None:
         """Drop entries from every per-type dict whose hash isn't in *hashlist*."""
@@ -388,6 +509,86 @@ class HashList(DataClassORJSONMixin):
             if root_list.sub_cmd == 0
         ]
 
+    @property
+    def computed_bol_hash(self) -> int:
+        """Compute the map's bol_hash from locally stored area hash IDs.
+
+        Mirrors the APK's ``HashDataManager.getDBCmHash()``, which MurMur-hashes
+        the list of all locally stored MapElement hashes.  When our stored area
+        hashes are in sync with the device, this value equals the device's
+        reported ``bol_hash`` in ``report_data.locations[0].bol_hash``.
+
+        Returns 0 when no area hashes have been fetched yet.
+        """
+        hashes = [h for h in self.area_root_hashlist if h != 0]
+        if not hashes:
+            return 0
+        return int(MurMurHashUtil.hash_unsigned_list(hashes))
+
+    @property
+    def computed_areas(self) -> list[AreaHashNameList]:
+        """Merge area_name and area into a fully-named list.
+
+        For every hash in self.area:
+        * If area_name already has an entry with a non-empty name → keep it.
+        * If area_name has an entry but name is empty → fill from FrameList.name,
+          or auto-assign the lowest unused "Area N" number.
+        * If area_name has no entry at all → same as above but also add one.
+
+        Returns a fresh list of fresh AreaHashNameList objects, so the caller
+        may mutate without affecting ``self.area_name``.
+        """
+        # O(A) — one pass to clone entries and build a hash → entry index, plus
+        # one pass to compute the initial set of used "Area N" numbers.  The
+        # main loop is then O(A) with O(1) lookups, replacing the previous
+        # O(A²) next()/comprehension-per-area pattern.
+        area_name_list: list[AreaHashNameList] = [AreaHashNameList(name=a.name, hash=a.hash) for a in self.area_name]
+        by_hash: dict[int, AreaHashNameList] = {a.hash: a for a in area_name_list}
+        used_numbers: set[int] = {
+            int(a.name.split()[-1])
+            for a in area_name_list
+            if a.name.lower().startswith("area ") and a.name.split()[-1].isdigit()
+        }
+        next_n = 1
+
+        def _take_next_number() -> int:
+            nonlocal next_n
+            while next_n in used_numbers:
+                next_n += 1
+            used_numbers.add(next_n)
+            return next_n
+
+        for hash_id, area in self.area.items():
+            existing_area = by_hash.get(hash_id)
+            if existing_area is None:
+                if area.name:
+                    entry = AreaHashNameList(name=area.name, hash=hash_id)
+                else:
+                    entry = AreaHashNameList(name=f"Area {_take_next_number()}", hash=hash_id)
+                area_name_list.append(entry)
+                by_hash[hash_id] = entry
+            elif not existing_area.name and area.name:
+                existing_area.name = area.name
+            elif not existing_area.name:
+                existing_area.name = f"Area {_take_next_number()}"
+
+        return area_name_list
+
+    def upsert_area_name(self, hash_id: int, name: str) -> None:
+        """Set (or insert) the display name for a single area hash.
+
+        Used by the ``toapp_map_name_msg`` reducer path: when the app renames an
+        area the device acks with one ``NavMapNameMsg`` (hash + new name) rather
+        than re-sending the whole ``toapp_all_hash_name`` list, so we patch the
+        matching ``area_name`` entry in place, appending one if the hash is not
+        yet tracked.
+        """
+        for entry in self.area_name:
+            if entry.hash == hash_id:
+                entry.name = name
+                return
+        self.area_name.append(AreaHashNameList(name=name, hash=hash_id))
+
     def missing_hashlist(self, sub_cmd: int = 0) -> list[int]:
         """Return hash IDs declared in ``root_hash_lists`` for *sub_cmd* but not yet fetched."""
         all_hash_ids = set(self.area.keys()).union(
@@ -428,10 +629,9 @@ class HashList(DataClassORJSONMixin):
         should use this method so interrupted areas trigger a fresh fetch.
         """
         path_type_mapping = self._get_path_type_mapping()
-        # missing_hashlist uses a union of *all* per-type keys for sub_cmd=0,
-        # so replicate that lookup for sub_cmd=0 too.
         if sub_cmd == 3:
             lookup: dict[int, FrameList] = self.line
+            svg_for_hash: dict[int, list[SvgFrameList]] = {}
         else:
             lookup = {}
             for target in path_type_mapping.values():
@@ -439,6 +639,22 @@ class HashList(DataClassORJSONMixin):
                     continue
                 for hash_id, frames in target.items():
                     lookup[hash_id] = frames
+            # Include unknown-type frames so hashes whose only data arrived
+            # under a type pymammotion doesn't model still count as fetched.
+            for bucket in self.unknown_type_frames.values():
+                for hash_id, frames in bucket.items():
+                    lookup.setdefault(hash_id, frames)
+            # Build a reverse mapping so each data_couple hash_id can be checked
+            # against every SVG tile it owns — both by direct data_hash match
+            # (when the SVG tile's own hash == the area hash) and by paternal_hash_a
+            # (when the SVG tile has a distinct hash but is linked to this area).
+            svg_for_hash = {}
+            for data_hash, svg_fl in self.svg.items():
+                svg_for_hash.setdefault(data_hash, []).append(svg_fl)
+                if svg_fl.data:
+                    parent = svg_fl.data[0].paternal_hash_a
+                    if parent and parent != data_hash:
+                        svg_for_hash.setdefault(parent, []).append(svg_fl)
 
         incomplete: list[int] = []
         for root_list in self.root_hash_lists:
@@ -446,8 +662,23 @@ class HashList(DataClassORJSONMixin):
                 continue
             for obj in root_list.data:
                 for hash_id in obj.data_couple:
-                    entry = lookup.get(hash_id)
-                    if entry is None or self.find_missing_frames(entry):
+                    if hash_id == 0:
+                        continue
+                    area_entry = lookup.get(hash_id)
+                    svg_entries = svg_for_hash.get(hash_id, [])
+
+                    # Nothing fetched at all for this hash yet.
+                    if area_entry is None and not svg_entries:
+                        incomplete.append(hash_id)
+                        continue
+
+                    # Area/boundary data exists but is still partial.
+                    if area_entry is not None and self.find_missing_frames(area_entry):
+                        incomplete.append(hash_id)
+                        continue
+
+                    # Any associated SVG tile (by data_hash or paternal_hash_a) is partial.
+                    if any(self.find_missing_frames(fl) for fl in svg_entries):
                         incomplete.append(hash_id)
         return incomplete
 
@@ -507,20 +738,21 @@ class HashList(DataClassORJSONMixin):
         frame_list = self._get_frame_list_by_type_and_hash(hash_data)
         return self.find_missing_frames(frame_list)
 
-    def _get_frame_list_by_type_and_hash(self, hash_data: NavGetCommDataAck | SvgMessageAckT) -> FrameList | None:
-        """Return the FrameList for *hash_data*, or ``None`` if the type isn't tracked.
+    def _get_frame_list_by_type_and_hash(
+        self, hash_data: NavGetCommDataAck | SvgMessageAckT
+    ) -> FrameList | SvgFrameList | None:
+        """Return the frame list for *hash_data*, or ``None`` if the type isn't tracked.
 
-        SvgMessageAckT keys by ``data_hash``; NavGetCommDataAck keys by ``hash``.
+        SvgMessageAckT keys by ``data_hash`` into self.svg (SvgFrameList);
+        NavGetCommDataAck keys by ``hash`` into the per-type FrameList dicts.
         """
+        if isinstance(hash_data, SvgMessageAckT):
+            return self.svg.get(hash_data.data_hash)
+
         path_type_mapping = self._get_path_type_mapping()
         target_dict = path_type_mapping.get(hash_data.type)
-
         if target_dict is None:
             return None
-
-        if isinstance(hash_data, SvgMessageAckT):
-            return target_dict.get(hash_data.data_hash)
-
         return target_dict.get(hash_data.hash)
 
     def update_plan(self, plan: Plan) -> None:
@@ -529,19 +761,24 @@ class HashList(DataClassORJSONMixin):
             self.plan[plan.plan_id] = plan
 
     def _get_path_type_mapping(self) -> dict[int, dict[int, FrameList]]:
-        """Return a ``PathType → per-type dict`` mapping for dispatch."""
+        """Return a ``PathType → per-type dict`` mapping for NavGetCommData dispatch.
+
+        SVG is intentionally excluded — SVG data arrives as SvgMessage (not
+        NavGetCommData) and is stored in self.svg (dict[int, SvgFrameList]).
+        """
         return {
             PathType.AREA: self.area,
             PathType.OBSTACLE: self.obstacle,
             PathType.PATH: self.path,
             PathType.LINE: self.line,
             PathType.DUMP: self.dump,
-            PathType.SVG: self.svg,
             PathType.VISUAL_SAFETY_ZONE: self.visual_safety_zone,
             PathType.VISUAL_OBSTACLE_ZONE: self.visual_obstacle_zone,
             PathType.CORRIDOR_LINE: self.corridor_line,
             PathType.CORRIDOR_POINT: self.corridor_point,
             PathType.VIRTUAL_WALL: self.virtual_wall,
+            PathType.NO_GO_ZONE_VARIANT: self.no_go_zone_variant,
+            PathType.NO_GO_ZONE: self.no_go_zone,
         }
 
     def update(self, hash_data: NavGetCommData | SvgMessage) -> bool:
@@ -550,30 +787,38 @@ class HashList(DataClassORJSONMixin):
         AREA frames also auto-assign an ``area_name`` ("Area N") if none exists
         for the hash yet.  DYNAMICS_LINE (type 18) is keyed by frame order and
         resets on ``current_frame == 1``.
+
+        Unknown types (e.g. radar-specific 23 we've seen on LUBA_VA) are stored
+        in ``unknown_type_frames`` so the hash is still tracked as "received".
+        Without this, ``find_incomplete_hashes`` would keep flagging the hash
+        as missing and ``MapFetchSaga`` would stall re-requesting it.
+
+        SvgMessage frames go to self.svg (SvgFrameList) via _add_svg_data.
+        NavGetCommData with type=SVG is discarded — real SVG geometry only
+        arrives as SvgMessage from toapp_svg_msg.
         """
-        if hash_data.type == PathType.AREA and isinstance(hash_data, NavGetCommData):
-            existing_name = next((area for area in self.area_name if area.hash == hash_data.hash), None)
-            if not existing_name:
-                used_numbers = {
-                    int(a.name.split()[-1])
-                    for a in self.area_name
-                    if a.name.startswith("Area ") and a.name.split()[-1].isdigit()
-                }
-                n = 1
-                while n in used_numbers:
-                    n += 1
-                self.area_name.append(AreaHashNameList(name=f"Area {n}", hash=hash_data.hash))
+        if isinstance(hash_data, SvgMessage):
+            return self._add_svg_data(self.svg, hash_data)
+
+        if hash_data.type == PathType.AREA:
             result = self._add_hash_data(self.area, hash_data)
             self.update_hash_lists(self.hashlist)
             return result
 
         # DYNAMICS_LINE is normally assembled by CommonDataSaga and stored via
         # update_dynamics_line; handle direct arrivals defensively here.
-        if hash_data.type == PathType.DYNAMICS_LINE and isinstance(hash_data, NavGetCommData):
+        if hash_data.type == PathType.DYNAMICS_LINE:
             if hash_data.current_frame == 1:
                 self.dynamics_line = []
             self.dynamics_line.extend(hash_data.data_couple)
             return True
+
+        # NavGetCommData with type=SVG carries no geometry — real SVG geometry only
+        # arrives as SvgMessage (toapp_svg_msg).  Discard rather than storing it as a
+        # geometry-less unknown-type frame (which would also mark the hash "received"
+        # via find_incomplete_hashes and skip fetching its real data).
+        if hash_data.type == PathType.SVG:
+            return False
 
         path_type_mapping = self._get_path_type_mapping()
         target_dict = path_type_mapping.get(hash_data.type)
@@ -581,7 +826,10 @@ class HashList(DataClassORJSONMixin):
         if target_dict is not None:
             return self._add_hash_data(target_dict, hash_data)
 
-        return False
+        # Unknown type — store under unknown_type_frames keyed by (type, hash)
+        # so the hash is still considered "received" by find_incomplete_hashes.
+        bucket = self.unknown_type_frames.setdefault(hash_data.type, {})
+        return self._add_hash_data(bucket, hash_data)
 
     def update_dynamics_line(self, points: list[CommDataCouple]) -> None:
         """Replace ``dynamics_line`` with *points*.
@@ -659,7 +907,7 @@ class HashList(DataClassORJSONMixin):
                 del target[hash_id]
 
     @staticmethod
-    def find_missing_frames(frame_list: FrameList | RootHashList | None) -> list[int]:
+    def find_missing_frames(frame_list: FrameList | SvgFrameList | RootHashList | None) -> list[int]:
         """Return 1-based frame numbers absent from ``frame_list.data``."""
         if frame_list is None:
             return []
@@ -672,32 +920,24 @@ class HashList(DataClassORJSONMixin):
         return [num for num in number_list if num not in current_frames]
 
     @staticmethod
-    def _add_hash_data(hash_dict: dict[int, FrameList], hash_data: NavGetCommData | SvgMessage) -> bool:
+    def _add_svg_data(svg_dict: dict[int, SvgFrameList], hash_data: SvgMessage) -> bool:
+        """Insert *hash_data* into *svg_dict*; return True if anything was stored."""
+        entry = svg_dict.get(hash_data.data_hash)
+        if entry is None:
+            svg_dict[hash_data.data_hash] = SvgFrameList(total_frame=hash_data.total_frame, data=[hash_data])
+            return True
+        if any(f.current_frame == hash_data.current_frame for f in entry.data):
+            return True
+        entry.data.append(hash_data)
+        return True
+
+    @staticmethod
+    def _add_hash_data(hash_dict: dict[int, FrameList], hash_data: NavGetCommData) -> bool:
         """Insert *hash_data* into *hash_dict*; return True if anything was stored.
 
         Creates a new FrameList for a first sighting, otherwise appends the
         frame unless its ``current_frame`` is already present.
         """
-        if isinstance(hash_data, SvgMessage):
-            if hash_dict.get(hash_data.data_hash, None) is None:
-                hash_dict[hash_data.data_hash] = FrameList(total_frame=hash_data.total_frame, data=[hash_data])
-                return True
-
-            if hash_data not in hash_dict[hash_data.data_hash].data:
-                exists = next(
-                    (
-                        rhl
-                        for rhl in hash_dict[hash_data.data_hash].data
-                        if rhl.current_frame == hash_data.current_frame
-                    ),
-                    None,
-                )
-                if exists:
-                    return True
-                hash_dict[hash_data.data_hash].data.append(hash_data)
-                return True
-            return False
-
         if hash_dict.get(hash_data.hash, None) is None:
             hash_dict[hash_data.hash] = FrameList(total_frame=hash_data.total_frame, data=[hash_data])
             return True
@@ -713,6 +953,33 @@ class HashList(DataClassORJSONMixin):
             return True
         return False
 
+    def is_map_synced(self, bol_hash: int) -> bool:
+        """Return True when the local map state is fully in sync with the device.
+
+        Three conditions must all hold:
+
+        * **BOL hash match** — ``computed_bol_hash == bol_hash``: our root hash
+          list reflects the device's current area set.
+        * **No incomplete areas** — ``find_incomplete_hashes(0)`` is empty:
+          every area declared in ``root_hash_lists`` has all its frame data.
+        * **Area names covered** — every hash in ``area_name`` is present in
+          ``area_root_hashlist``: the device's name list and our root manifest
+          agree on which areas exist.
+
+        Returns False immediately when *bol_hash* is 0 (device has not yet
+        reported a valid hash) or when ``root_hash_lists`` is empty.
+        """
+        if not bol_hash:
+            return False
+        if MurMurHashUtil.hash_unsigned_list(self.area_root_hashlist) != bol_hash:
+            return False
+        if self.computed_bol_hash != bol_hash:
+            return False
+        if self.find_incomplete_hashes(0):
+            return False
+        area_name_hashes = {a.hash for a in self.area_name}
+        return not area_name_hashes or area_name_hashes.issubset(set(self.area_root_hashlist))
+
     def invalidate_maps(self, bol_hash: int) -> None:
         """Trigger a map re-fetch when the device reports a new ``bol_hash``.
 
@@ -720,17 +987,20 @@ class HashList(DataClassORJSONMixin):
         of the current area-root hash list.  A mismatch means the map was
         edited device-side.
 
-        Only ``root_hash_lists`` is cleared so that :class:`MapFetchSaga` knows
-        to re-request it.  Per-type dicts (``area``, ``path``, ``obstacle`` …)
-        are preserved: once the new root hash list is fetched,
+        Only ``root_hash_lists`` entries with ``sub_cmd == 0`` (areas) are
+        removed so that :class:`MapFetchSaga` knows to re-request the area
+        manifest.  Entries for other sub_cmds (lines, dump points, …) are
+        preserved.  Per-type geometry dicts (``area``, ``path``, ``obstacle`` …)
+        are also preserved: once the new root hash list is fetched,
         :meth:`update_hash_lists` filters them to remove hash IDs that are no
         longer present, so entries for deleted areas are discarded then rather
         than now.  Hash IDs that remain in the new list re-use their cached
         frames and are not re-fetched.
         """
-        if MurMurHashUtil.hash_unsigned_list(self.area_root_hashlist) == bol_hash:
+        if not bol_hash or MurMurHashUtil.hash_unsigned_list(self.area_root_hashlist) == bol_hash:
             return
-        self.root_hash_lists = []
+        self.root_hash_lists = [rl for rl in self.root_hash_lists if rl.sub_cmd != 0]
+        self.update_hash_lists(self.hashlist)
 
     def invalidate_mow_path(self, path_hash: int) -> None:
         """Clear cached mow-path data once the job has ended.
@@ -739,21 +1009,21 @@ class HashList(DataClassORJSONMixin):
         be preserved — the device advances ub_path_hash through segments during
         a mow and wiping on every change would discard live data.
         """
-        if path_hash == 0 or path_hash == 1:
+        if path_hash == 0:
             self.current_mow_path = {}
             self.generated_mow_path_geojson = {}
             self.generated_mow_progress_geojson = {}
             self.last_ub_path_hash = 0
 
-    def has_mow_path_for_hash(self, ub_path_hash: int) -> bool:
-        """Return True if cover-path data for *ub_path_hash* is already cached.
+    def has_mow_path_for_hash(self, path_hash: int) -> bool:
+        """Return True if cover-path data for *path_hash* is already cached.
 
         Matches against ``path_packets[0].path_hash`` in any transaction's first
-        frame — the device uses ub_path_hash to identify the active segment.
+        frame — equals ``work.path_hash`` (field 2) when the cached data is current.
         """
         for frames in self.current_mow_path.values():
             for mow_path in frames.values():
-                if mow_path.path_packets and mow_path.path_packets[0].path_hash == ub_path_hash:
+                if mow_path.path_packets and mow_path.path_packets[0].path_hash == path_hash:
                     return True
         return False
 
@@ -778,26 +1048,29 @@ class HashList(DataClassORJSONMixin):
         coordinate rotation used at generation time no longer matches the
         current RTK heading, so the GeoJSON should be regenerated.
 
-        Hash staleness is detected by comparing the hashes present in the
-        GeoJSON features against the device's current ``area_root_hashlist``
-        (sub_cmd=0 entries only; sub_cmd=3 breakpoint lines are never rendered
-        in the GeoJSON).  Any feature hash absent from the root list means the
-        GeoJSON was built from data that has since been deleted on the device.
+        Hash staleness is detected by comparing the current
+        ``area_root_hashlist`` against the snapshot taken when the GeoJSON was
+        last built.  If unchanged, the expensive per-feature hash walk is
+        skipped — the dominant cost on the ~4 Hz ``system_update_buf`` hot
+        path during mowing.
         """
         if not self.generated_geojson:
             return True
         if abs(rtk.yaw - self.geojson_yaw) > yaw_threshold:
             return True
-        current_hashlist = set(self.area_root_hashlist)
-        if current_hashlist:
-            geojson_hashes = {
-                f["properties"]["hash"]
-                for f in self.generated_geojson.get("features", [])
-                if isinstance(f.get("properties"), dict) and f["properties"].get("hash") is not None
-            }
-            if geojson_hashes - current_hashlist:
-                return True
-        return False
+        current_hashlist = frozenset(self.area_root_hashlist)
+        if not current_hashlist:
+            return False
+        if current_hashlist == self._geojson_hashlist_snapshot:
+            return False
+        # Hashlist changed since last generation — verify whether any feature
+        # references a hash that no longer exists on the device.
+        geojson_hashes = {
+            f["properties"]["hash"]
+            for f in self.generated_geojson.get("features", [])
+            if isinstance(f.get("properties"), dict) and f["properties"].get("hash") is not None
+        }
+        return bool(geojson_hashes - current_hashlist)
 
     def generate_geojson(self, rtk: LocationPoint, dock: Dock) -> Any:
         """Rebuild ``generated_geojson`` from the cached frames."""
@@ -817,6 +1090,9 @@ class HashList(DataClassORJSONMixin):
             yaw=rtk.yaw,
         )
         self.geojson_yaw = rtk.yaw
+        # Record the hashlist used so the next geojson_needs_regeneration()
+        # can short-circuit when state hasn't changed.
+        self._geojson_hashlist_snapshot = frozenset(self.area_root_hashlist)
 
     def generate_mowing_geojson(self, rtk: LocationPoint) -> Any:
         """Rebuild ``generated_mow_path_geojson`` from the cached mow-path frames."""
@@ -849,7 +1125,10 @@ class HashList(DataClassORJSONMixin):
         """
         from pymammotion.data.model.generate_geojson import GeojsonGenerator
 
-        if rtk.latitude == 0 or now_index < 0 or not self.current_mow_path:
+        # "Unset" RTK is the exact-0.0 default (radians).  Compare to 0.0, NOT round(lat, 0):
+        # rounding to 0 decimals collapses everything within ~0.5 rad (~28°) of the equator to
+        # 0 and would skip real fixes.
+        if rtk.latitude == 0.0 or now_index < 0 or not self.current_mow_path:
             return
 
         raw_x = path_pos_x / 10000.0
@@ -874,7 +1153,7 @@ class HashList(DataClassORJSONMixin):
         """
         from pymammotion.data.model.generate_geojson import GeojsonGenerator
 
-        if rtk.latitude == 0 or len(self.dynamics_line) < 2:
+        if rtk.latitude == 0.0 or len(self.dynamics_line) < 2:
             return
 
         conv = CoordinateConverter(rtk.latitude, rtk.longitude)

@@ -19,8 +19,8 @@ uv sync
 uv run ruff check --fix pymammotion/
 uv run ruff format pymammotion/
 
-# Type checking (excludes proto/, tests/, scripts/, linkkit/)
-uv run mypy pymammotion/
+# Type checking (excludes proto/, tests/, scripts/, linkkit/ — configured in pyproject.toml [tool.ty])
+uv run ty check pymammotion/
 
 # Additional linting
 uv run pylint pymammotion/
@@ -139,6 +139,11 @@ Decompiled APK source (Mammotion 2.2.4.13) is available at:
 /home/michael/Downloads/Mammotion_2.2.4.13_APKPure/com.agilexrobotics/java_src/com/agilexrobotics/
 ```
 
+Decompiled APK source (Mammotion 2.3.8.201) is available at:
+```
+/home/michael/Downloads/mammotion-2-3-8-201/agilex/java_src/com/agilexrobotics/
+```
+
 Key files for protocol/logic research:
 - `mvp/fieldmower/device/HashDataManager.java` — map/hash/line/cover-path fetch logic, clearing conditions, retry logic
 - `mvp/fieldmower/device/MACarDataManager.java` — incoming message parsing, device state callbacks, calls to HashDataManager
@@ -154,9 +159,9 @@ Key files for protocol/logic research:
 - **Python version:** 3.12+
 - **Type stubs** for missing third-party types are in `stubs/`
 - Ruff excludes `pymammotion/proto/`, `tests/`, and `scripts/` from linting
-- mypy excludes `pymammotion/proto/`, `tests/`, `scripts/`, and `pymammotion/mqtt/linkkit/`
-- Strict mypy config: `disallow_untyped_defs`, `disallow_untyped_calls`, `disallow_any_generics`
+- ty excludes `pymammotion/proto/**`, `tests/**`, `scripts/**`, `examples/**`, and `pymammotion/mqtt/linkkit/**`
 - **No local imports inside function bodies** — always use top-level imports. Exception: `TYPE_CHECKING` guards for type-hint-only imports that would cause circular imports at runtime.
+- **Walrus operator (`:=`)** — prefer it wherever it removes a separate assignment line: guards (`if x := foo()`), loop conditions (`while chunk := f.read()`), and inline captures inside comprehensions or `match` arms. Only avoid it when the binding would make the expression harder to read than two lines would.
 
 ## Working in this codebase (rules for Claude)
 

@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pymammotion"
-version = "0.7.114.post5"
+version = "0.8.4.post1"
 description = ""
 authors = [
     { name = "Michael Arthur", email = "michael@jumblesoft.co.nz" },
     { name = "jLynx" },
 ]
-requires-python = ">=3.14,<3.15"
+requires-python = ">=3.13,<3.15"
 readme = "README.md"
 license = "GPL-3.0"
 dependencies = [
@@ -32,9 +32,9 @@ dependencies = [
     "websockets>=13.1",
     "webrtc-models>=0.3.0",
     "aiomqtt>=2.5.1",
-    "bluetooth-adapters>=2.0.0",
     "pyrsistent>=0.20.0",
     "python-dotenv>=1.0.0",
+    "pillow>=11.0.0",
 ]
 
 [dependency-groups]
@@ -43,6 +43,7 @@ extras = [
     "nest-asyncio>=1.6.0,<2",
     "aioesphomeapi>=44.23.0",
     "bleak-esphome>=3.7.3",
+    "bluetooth-adapters>=2.0.0",
 ]
 dev = [
     "types-protobuf>=6.32.1.20250918,<7",
@@ -55,13 +56,14 @@ dev = [
     "pylint>=4.0.2,<5",
     "ruff>=0.9.3,<0.10",
     "pre-commit>=4.3.0,<5",
-    "mypy>=1.18.2,<2",
     "autotyping>=24.9.0",
     "ipython>=9.6.0,<10",
     "pytest-asyncio>=0.23",
     "pip>=26.1",
     "vulture>=2.16",
     "pymap3d>=3.2.0",
+    "ty>=0.0.35",
+    "pytest-cov>=7.1.0",
 ]
 
 [tool.uv]
@@ -77,7 +79,7 @@ include = ["pymammotion"]
 include = ["pymammotion"]
 
 [tool.bumpver]
-current_version = "0.7.113"
+current_version = "0.8.4"
 version_pattern = "MAJOR.MINOR.PATCH"
 commit_message  = "Bump version {old_version} -> {new_version}"
 commit          = true
@@ -94,7 +96,7 @@ push            = false
 pymammotion = ["py.typed"]
 
 [tool.pylint]
-py-version = "3.14"
+py-version = "3.13"
 ignore = [
     "tests",
     "scripts",
@@ -397,6 +399,10 @@ max-line-length-suggestions = 120
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+markers = [
+    "live: tests that hit a real Mammotion device (skipped by default; requires MAMMOTION_EMAIL/PASSWORD env vars)",
+]
 
 [tool.ruff]
 required-version = ">=0.4.3"
@@ -464,6 +470,49 @@ ignore = [
     "D203", # Conflicts with other rules
     "D417", # False positives in some occasions
     "ISC001", # Conflicts with formatter
+
+    # Naming exemptions for code that mirrors Mammotion's mixed-case wire format
+    # (protobuf-derived dataclasses, MQTT property keys, etc.).
+    "N802", # invalid function name (not snake_case)
+    "N803", # invalid argument name
+    "N806", # non-lowercase variable in function
+    "N815", # mixed-case variable in class scope
+
+    # Docstring presence / cosmetic style. Per #6 discussion: D102 and D103
+    # remain enforced (docstrings required on every function and method);
+    # the four cosmetic D-rules (D205 / D400 / D401 / D415) are also
+    # enforced. Module / package / magic-method / __init__ / nested-class
+    # presence rules below are kept ignored.
+    "D100", # undocumented public module
+    "D104", # undocumented public package
+    "D105", # undocumented magic method
+    "D106", # undocumented public nested class
+    "D107", # undocumented public __init__
+
+    # Type annotation gaps. Type coverage improves incrementally; blanket
+    # enforcement creates churn without proportional safety gain.
+    "ANN001", # missing type annotation for function argument
+    "ANN201", # missing return type for public function
+    "ANN204", # missing return type for special method
+    "ANN205", # missing return type for static method
+    "ANN206", # missing return type for classmethod
+
+    # Style preferences with no safety value.
+    "G004",   # logging f-string (modern Python; equivalent perf)
+    "FBT001", # boolean-trap: positional bool argument
+    "FBT002", # boolean-trap: default bool argument
+    "FBT003", # boolean-trap: positional bool literal at call site
+    "EM101",  # raw string in exception
+    "EM102",  # f-string in exception
+    "TRY300", # try-consider-else
+
+    # Comment / metadata hygiene. False-positive heavy or low-value.
+    "ERA001", # commented-out-code (frequent false positives in dataclasses)
+    "PGH003", # blanket type-ignore (codebase convention)
+    "FIX002", # line contains TODO
+    "TD002",  # missing TODO author
+    "TD003",  # missing TODO link
+    "TD004",  # missing TODO colon
 ]
 
 [tool.ruff.lint.isort]
@@ -475,46 +524,18 @@ combine-as-imports = true
 [tool.ruff.lint.mccabe]
 max-complexity = 25
 
-[tool.mypy]
-# Specify the target platform details in config, so your developers are
-# free to run mypy on Windows, Linux, or macOS and get consistent
-# results.
-platform = "linux"
-python_version = "3.14"
-exclude = ['pymammotion/proto', 'tests', 'examples', "scripts"]
+[tool.ty.environment]
+python-version = "3.12"
 
-# parity with previous mypy.ini
-show_error_codes = true
-local_partial_types = true
-strict_equality = true
-warn_unreachable = true
-enable_error_code = ["ignore-without-code", "redundant-self", "truthy-iterable"]
-disable_error_code = ["annotation-unchecked", "import-not-found", "import-untyped"]
-extra_checks = false
+[tool.ty.rules]
+unresolved-import = "ignore"
 
-# Use local stubs for third-party packages missing type hints
-mypy_path = "stubs"
-
-# show error messages from unrelated files
-follow_imports = "skip"
-
-# suppress errors about unsatisfied imports
-ignore_missing_imports = true
-
-# be strict
-check_untyped_defs = true
-disallow_any_generics = true
-disallow_incomplete_defs = true
-# Follow mypy.ini behavior
-disallow_subclassing_any = false
-disallow_untyped_calls = true
-disallow_untyped_decorators = true
-disallow_untyped_defs = true
-no_implicit_optional = true
-strict_optional = true
-warn_incomplete_stub = true
-warn_no_return = true
-warn_redundant_casts = true
-warn_return_any = true
-warn_unused_configs = true
-warn_unused_ignores = true
+[tool.ty.src]
+exclude = [
+    "pymammotion/proto/**",
+    "pymammotion/mqtt/linkkit/**",
+    "tests/**",
+    "scripts/**",
+    "examples/**",
+    ".claude/**",
+]

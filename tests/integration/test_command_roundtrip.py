@@ -41,6 +41,7 @@ def _make_transport(transport_type: TransportType, *, connected: bool = True) ->
     transport.is_rate_limited = False
     transport.last_send_monotonic = 0.0  # 0.0 = never sent (matches Transport base default)
     transport.send = AsyncMock()
+    transport.send_heartbeat = AsyncMock()
     transport.disconnect = AsyncMock()
     transport.on_message = None
     return transport
@@ -138,7 +139,7 @@ async def test_happy_path_mqtt_command_round_trip() -> None:
     # Capture the bytes sent so we can verify send() was called
     sent_payloads: list[bytes] = []
 
-    async def fake_send(payload: bytes, iot_id: str = "") -> None:
+    async def fake_send(payload: bytes, iot_id: str = "", firmware_version: str = "") -> None:
         sent_payloads.append(payload)
         # Simulate the device responding after a small delay
         async def _deliver() -> None:
@@ -212,7 +213,7 @@ async def test_ble_preferred_when_connected() -> None:
     broker = handle.broker
     mock_response = _make_mock_response("toapp_gethash_ack")
 
-    async def ble_fake_send(payload: bytes, iot_id: str = "") -> None:  # noqa: ARG001
+    async def ble_fake_send(payload: bytes, iot_id: str = "", firmware_version: str = "") -> None:  # noqa: ARG001
         async def _deliver() -> None:
             await asyncio.sleep(0.05)
             await broker.on_message(mock_response)
@@ -409,11 +410,12 @@ async def test_map_saga_refetches_area_names_on_each_run() -> None:
 
 
 async def test_ble_sync_sent_before_payload_after_5_minute_idle() -> None:
-    """_send_marked must prepend a BLE sync when no command was sent for > 5 minutes.
+    """_send_marked must fire a BLE sync when no command was sent for > 5 minutes.
 
-    The sync is sent directly, immediately before the payload — not queued
-    separately, so ordering is guaranteed even under queue backpressure.
+    The sync is fire-and-forget via ``asyncio.create_task`` so it does not delay
+    the user's payload, but it must still be scheduled alongside the real send.
     """
+    import asyncio
     import time
 
     mqtt_transport = _make_transport(TransportType.CLOUD_ALIYUN, connected=True)
@@ -424,18 +426,22 @@ async def test_ble_sync_sent_before_payload_after_5_minute_idle() -> None:
 
     sent: list[bytes] = []
 
-    async def capture_send(payload: bytes, iot_id: str = "") -> None:  # noqa: ARG001
+    async def capture_send(payload: bytes, iot_id: str = "", firmware_version: str = "") -> None:  # noqa: ARG001
         sent.append(payload)
 
     mqtt_transport.send.side_effect = capture_send
 
     # Directly call _send_marked (the path used inside send_command)
     await handle._send_marked(mqtt_transport, b"\xde\xad")
+    # Let the fire-and-forget BLE sync task run
+    await asyncio.sleep(0)
 
-    assert len(sent) == 2, f"Expected sync + payload (2 sends), got {len(sent)}: {sent}"
-    # First send is the BLE sync (send_todev_ble_sync returns non-empty bytes)
-    assert sent[0] != b"\xde\xad", "First send should be the BLE sync, not the payload"
-    assert sent[1] == b"\xde\xad", "Second send should be the actual payload"
+    # Sync goes through send_heartbeat (quota-exempt path); payload goes through send
+    mqtt_transport.send_heartbeat.assert_awaited_once()
+    sync_payload = mqtt_transport.send_heartbeat.call_args[0][0]
+    assert sync_payload != b"\xde\xad", "Heartbeat arg should be the BLE sync, not the payload"
+    assert len(sent) == 1, f"Expected only payload via send, got {len(sent)}: {sent}"
+    assert sent[0] == b"\xde\xad", "send() should carry the actual payload"
 
 
 async def test_no_ble_sync_when_recently_active() -> None:
@@ -450,7 +456,7 @@ async def test_no_ble_sync_when_recently_active() -> None:
 
     sent: list[bytes] = []
 
-    async def capture_send(payload: bytes, iot_id: str = "") -> None:  # noqa: ARG001
+    async def capture_send(payload: bytes, iot_id: str = "", firmware_version: str = "") -> None:  # noqa: ARG001
         sent.append(payload)
 
     mqtt_transport.send.side_effect = capture_send
@@ -471,7 +477,7 @@ async def test_no_ble_sync_on_first_ever_send() -> None:
 
     sent: list[bytes] = []
 
-    async def capture_send(payload: bytes, iot_id: str = "") -> None:  # noqa: ARG001
+    async def capture_send(payload: bytes, iot_id: str = "", firmware_version: str = "") -> None:  # noqa: ARG001
         sent.append(payload)
 
     mqtt_transport.send.side_effect = capture_send

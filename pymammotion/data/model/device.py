@@ -14,7 +14,7 @@ from pymammotion.data.model.enums import TaskAreaStatus
 from pymammotion.data.model.errors import DeviceErrors
 from pymammotion.data.model.events import Events
 from pymammotion.data.model.location import Location
-from pymammotion.data.model.pool_state import PoolMap, PoolState
+from pymammotion.data.model.pool_state import PoolMap, PoolPlan, PoolState
 from pymammotion.data.model.report_info import BaseScore, LocationData, ReportData, WorkSessionResult
 from pymammotion.data.model.work import CurrentTaskSettings
 from pymammotion.data.mqtt.event import ThingEventMessage
@@ -32,6 +32,7 @@ from pymammotion.proto import (
     SysWorkState,
 )
 from pymammotion.utility.constant import MOWING_ACTIVE_MODES
+from pymammotion.utility.constant.device_constant import WorkMode
 from pymammotion.utility.conversions import parse_double
 from pymammotion.utility.device_config import DeviceConfig
 from pymammotion.utility.map import CoordinateConverter
@@ -55,6 +56,19 @@ class Device(DataClassORJSONMixin):
     mqtt_properties: ThingPropertiesMessage | None = None
     status_properties: ThingStatusMessage | None = None
     device_event: ThingEventMessage | None = None
+
+    def apply_version_check(self, check: CheckDeviceVersion) -> None:
+        """Store the OTA version-check result and seed the current firmware version.
+
+        ``check.current_version`` is the cloud's view of the installed firmware.
+        Mirror it into ``device_firmwares.device_version`` (when the subclass
+        tracks firmware) so consumers have a version before any protobuf report
+        arrives; the state reducer refreshes it from telemetry once reports flow.
+        """
+        self.update_check = check
+        device_firmwares = getattr(self, "device_firmwares", None)
+        if device_firmwares is not None and check.current_version:
+            device_firmwares.device_version = check.current_version
 
 
 @dataclass
@@ -183,11 +197,12 @@ class MowerDevice(Device):
         if (
             (rtk := toapp_report_data.rtk)
             and (mqtt_rtk := rtk.mqtt_rtk_info)
-            and self.location.RTK.latitude == 0
-            and self.location.RTK.longitude == 0
+            and self.location.RTK.latitude == 0.0
+            and self.location.RTK.longitude == 0.0
         ):
-            self.location.RTK.longitude = math.radians(mqtt_rtk.longitude)
-            self.location.RTK.latitude = math.radians(mqtt_rtk.latitude)
+            if mqtt_rtk.latitude != 0.0:
+                self.location.RTK.longitude = math.radians(mqtt_rtk.longitude)
+                self.location.RTK.latitude = math.radians(mqtt_rtk.latitude)
 
         coordinate_converter = CoordinateConverter(self.location.RTK.latitude, self.location.RTK.longitude)
         for index, location in enumerate(toapp_report_data.locations):
@@ -200,7 +215,6 @@ class MowerDevice(Device):
                 east_geo = math.cos(yaw) * x_dev - math.sin(yaw) * y_dev
                 north_geo = math.sin(yaw) * x_dev + math.cos(yaw) * y_dev
                 self.location.device = coordinate_converter.enu_to_lla(north_geo, east_geo)
-                self.map.invalidate_maps(location.bol_hash)
                 self.location.work_zone = location.zone_hash
 
         if toapp_report_data.fw_info:
@@ -263,7 +277,9 @@ class MowerDevice(Device):
         self.report_data.rtk.gps_stars = int(toapp_mow_info.rt_kstars)
 
     def mow_info(self, toapp_mow_info: MowToAppInfoT) -> None:
-        """Handle sys.mow_to_app_info; distinct from sys.toapp_mow_info."""
+        """Handle sys.mow_to_app_info; type 3 signals a power-off event."""
+        if toapp_mow_info.type == 3:
+            self.report_data.dev.sys_status = WorkMode.MODE_POWER_OFF
 
     def report_missing_data(self) -> list[str]:
         """Report what data is missing for basic operation."""
@@ -336,6 +352,14 @@ class PoolCleanerDevice(Device):
     iot_id: str = ""
     pool_state: PoolState = field(default_factory=PoolState)
     pool_map: PoolMap = field(default_factory=PoolMap)
+    plans: dict[int, PoolPlan] = field(default_factory=dict)
+    """Scheduled cleaning plans, keyed by ``PoolPlan.jobid``. Populated by
+    the PoolStateReducer from ``LubaMsg.ctrl.plan_job_set`` frames; fetched
+    by ``MammotionClient.start_spino_plan_sync``."""
+    plans_stale: bool = False
+    """Set by the reducer when it sees a ``plan_job_set`` with a
+    ``totalplannum`` greater than ``len(plans)`` — a hint to the HA polling
+    layer that a re-fetch is required."""
     device_firmwares: DeviceFirmwares = field(default_factory=DeviceFirmwares)
     errors: DeviceErrors = field(default_factory=DeviceErrors)
 
@@ -441,8 +465,17 @@ def create_device(name: str, product_key: str = "") -> "Device":
     if DeviceType.is_swimming_pool(name):
         return PoolCleanerDevice(name=name)
     if DeviceType.is_rtk(name, product_key):
-        return RTKBaseStationDevice(name=name)
-    return MowerDevice(name=name)
+        rtk = RTKBaseStationDevice(name=name)
+        if product_key:
+            rtk.product_key = product_key
+        return rtk
+    mower = MowerDevice(name=name)
+    if product_key:
+        # Seed product_key from the device list so it's available before any
+        # protobuf telemetry arrives; the reducer refreshes it from
+        # toapp_wifi_iot_status once a report comes in.
+        mower.mower_state.product_key = product_key
+    return mower
 
 
 # Backwards-compatible alias. The library was previously called MowingDevice
@@ -463,5 +496,5 @@ def _mower_device_to_json(self: "MowerDevice", **kwargs: Any) -> str:
     return _mower_device_to_jsonb(self, **kwargs).decode()
 
 
-MowerDevice.to_jsonb = _mower_device_to_jsonb
-MowerDevice.to_json = _mower_device_to_json
+MowerDevice.to_jsonb = _mower_device_to_jsonb  # type: ignore
+MowerDevice.to_json = _mower_device_to_json  # type: ignore

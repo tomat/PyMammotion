@@ -58,7 +58,29 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from pymammotion.account.registry import BLE_ONLY_ACCOUNT
 from pymammotion.client import MammotionClient
+from pymammotion.messaging.broker import _LUBA_SUB_GROUP
 from pymammotion.transport.base import Subscription, TransportType
+
+
+def _commondata_detail(leaf_name: str, leaf_val: Any) -> str:
+    """Annotate ``todev_get_commondata`` with sync/ack distinction.
+
+    ``synchronize_hash_data`` and ``get_regional_data`` both wrap
+    ``NavGetCommData`` so they're indistinguishable by leaf name alone.
+    ``current_frame > 0`` means this is an ack of a received frame;
+    ``current_frame == 0`` means it's a fresh sync/fetch request.
+    """
+    if leaf_name != "todev_get_commondata" or leaf_val is None:
+        return ""
+    try:
+        current_frame = int(getattr(leaf_val, "current_frame", 0) or 0)
+        total_frame = int(getattr(leaf_val, "total_frame", 0) or 0)
+        hash_val = int(getattr(leaf_val, "hash", 0) or 0)
+    except (TypeError, ValueError):
+        return ""
+    if current_frame > 0:
+        return f" [ack frame={current_frame}/{total_frame} hash={hash_val}]"
+    return f" [sync hash={hash_val}]"
 
 
 class ExternalMQTT(Protocol):
@@ -166,6 +188,7 @@ class DevConsole:
             external_mqtt.dev_console = self
         # Strong references to all callbacks and subscriptions — must outlive the connection
         self._notification_cbs: dict[str, tuple[Callable[..., Awaitable[None]], Subscription]] = {}
+        self._sent_cbs: dict[str, tuple[Callable[..., Awaitable[None]], Subscription]] = {}
 
     # ── File helpers ──────────────────────────────────────────────────────────
 
@@ -192,27 +215,53 @@ class DevConsole:
 
     # ── Callback factory ──────────────────────────────────────────────────────
 
+    @staticmethod
+    def _describe_luba_msg(msg: Any) -> str:
+        """Return ``"group.sub_name[ detail]"`` (e.g. ``"nav.toapp_gethash_ack"``) for a LubaMsg.
+
+        Falls back to the top-level group name when no leaf can be extracted, or
+        ``"(empty)"`` if the message has no recognizable sub-group.
+
+        For ``nav.todev_get_commondata`` the inner field combo is annotated so a
+        ``synchronize_hash_data`` (sub_cmd=1, current_frame=0) can be distinguished
+        from a ``get_regional_data`` ack (current_frame>0) — both wrap the same
+        protobuf field and would otherwise be indistinguishable.
+        """
+        import betterproto2
+
+        try:
+            sub_name, sub_val = betterproto2.which_one_of(msg, "LubaSubMsg")
+        except Exception:  # noqa: BLE001
+            return "(message)"
+        if not sub_name:
+            return "(empty)"
+        leaf_group = _LUBA_SUB_GROUP.get(sub_name)
+        if leaf_group and sub_val is not None:
+            try:
+                leaf_name, leaf_val = betterproto2.which_one_of(sub_val, leaf_group)
+                if leaf_name:
+                    detail = _commondata_detail(leaf_name, leaf_val)
+                    return f"{sub_name}.{leaf_name}{detail}"
+            except Exception:  # noqa: BLE001, S110
+                pass
+        return sub_name
+
     def _make_notification_cb(self, device_name: str) -> Callable[[Any], Awaitable[None]]:
         """Return an async callback for broker.subscribe_unsolicited.
 
         Called with a LubaMsg on every unsolicited incoming message.
         """
-        import betterproto2
 
         async def _on_message(msg: Any) -> None:
             if self.always_dump:
                 self.dump(device_name)
             if self.external_mqtt is not None and self.external_mqtt.connected:
                 await self.external_mqtt._publish_device_to_external_mqtt(device_name)
-            try:
-                sub_name, _ = betterproto2.which_one_of(msg, "LubaSubMsg")
-                _LOGGER.info(
-                    "[bold cyan]← %s[/bold cyan]  [green]%s[/green]",
-                    device_name,
-                    sub_name,
-                )
-            except Exception:  # noqa: BLE001
-                _LOGGER.info("[bold cyan]← %s[/bold cyan]  [green](message)[/green]", device_name)
+            _LOGGER.info(
+                "[bold cyan]← %s[/bold cyan]  [green]%s[/green]",
+                device_name,
+                self._describe_luba_msg(msg),
+            )
 
         return _on_message
 
@@ -322,6 +371,30 @@ class DevConsole:
 
     # ── Device wiring ─────────────────────────────────────────────────────────
 
+    def _make_sent_cb(self, device_name: str) -> Callable[[bytes], Awaitable[None]]:
+        """Return an async callback for handle.subscribe_sent.
+
+        Called with the raw command bytes of every outbound payload.
+        """
+        from pymammotion.proto import LubaMsg
+
+        async def _on_sent(payload: bytes) -> None:
+            try:
+                msg = LubaMsg().parse(payload)
+                _LOGGER.info(
+                    "[bold yellow]→ %s[/bold yellow]  [magenta]%s[/magenta]",
+                    device_name,
+                    self._describe_luba_msg(msg),
+                )
+            except Exception:  # noqa: BLE001
+                _LOGGER.info(
+                    "[bold yellow]→ %s[/bold yellow]  [magenta](%d bytes)[/magenta]",
+                    device_name,
+                    len(payload),
+                )
+
+        return _on_sent
+
     def hook_device(self, device_name: str) -> None:
         """Attach the state-change callback to a device (idempotent)."""
         if device_name in self._notification_cbs:
@@ -332,7 +405,10 @@ class DevConsole:
         cb = self._make_notification_cb(device_name)
         sub = handle.broker.subscribe_unsolicited(cb)
         self._notification_cbs[device_name] = (cb, sub)  # keep both alive
-        _LOGGER.info("Hooked broker callback for [bold]%s[/bold]", device_name)
+        sent_cb = self._make_sent_cb(device_name)
+        sent_sub = handle.subscribe_sent(sent_cb)
+        self._sent_cbs[device_name] = (sent_cb, sent_sub)
+        _LOGGER.info("Hooked broker + sent callbacks for [bold]%s[/bold]", device_name)
 
     def hook_all_devices(self) -> None:
 
@@ -372,7 +448,10 @@ class DevConsole:
         cb = self._make_rtk_state_cb(device_name)
         sub = handle.subscribe_state_changed(cb)
         self._notification_cbs[device_name] = (cb, sub)
-        _LOGGER.info("Hooked state-change callback for RTK [bold]%s[/bold]", device_name)
+        sent_cb = self._make_sent_cb(device_name)
+        sent_sub = handle.subscribe_sent(sent_cb)
+        self._sent_cbs[device_name] = (sent_cb, sent_sub)
+        _LOGGER.info("Hooked state-change + sent callbacks for RTK [bold]%s[/bold]", device_name)
 
     def hook_all_rtk_devices(self) -> None:
         """Attach state-change callbacks to every registered RTK base station."""
@@ -794,7 +873,7 @@ async def _bootstrap_ble_via_proxy(
 async def _main(args: argparse.Namespace) -> None:
     _setup_logging()
 
-    mammotion = MammotionClient("0.5.27")
+    mammotion = MammotionClient("0.6.0")
     main_loop = asyncio.get_running_loop()
     dev = DevConsole(mammotion, main_loop)
 
@@ -875,17 +954,17 @@ async def _main(args: argparse.Namespace) -> None:
         "\n[bold green][PyMammotion dev console][/bold green]\n"
         f"  [cyan]devices[/cyan]  = {device_names}\n\n"
         f"{listen_note}"
-        "  [cyan]send(name, cmd, **kwargs)[/cyan]                          — queue a command (blocking)\n"
+        "  [cyan]send(name, cmd, **kwargs)[/cyan]                           — queue a command (blocking)\n"
         "  [cyan]send_and_wait(name, cmd, expected_field, **kwargs)[/cyan]  — send and block for response\n"
-        "  [cyan]sync_map(name)[/cyan]                                     — run a full MapFetchSaga (blocking)\n"
-        "  [cyan]fetch_rtk(name)[/cyan]                                    — fetch LoRa version for an RTK base station\n"
-        "  [cyan]dump(name)[/cyan]                                         — write state_{name}.json\n"
-        "  [cyan]dump_all()[/cyan]                                         — write state JSON for all devices\n"
-        "  [cyan]status()[/cyan]                                           — show connection status\n"
-        "  [cyan]creds()[/cyan]                                            — print all MQTT credentials\n"
-        "  [cyan]debug(on=True)[/cyan]                                     — toggle DEBUG logging on terminal\n"
-        "  [cyan]listen(on=True)[/cyan]                                    — stop/resume MQTT polling on all devices\n"
-        f"  [cyan]loop[/cyan]                                               — main asyncio event loop\n"
+        "  [cyan]sync_map(name)[/cyan]                                      — run a full MapFetchSaga (blocking)\n"
+        "  [cyan]fetch_rtk(name)[/cyan]                                     — fetch LoRa version for an RTK base station\n"
+        "  [cyan]dump(name)[/cyan]                                          — write state_{name}.json\n"
+        "  [cyan]dump_all()[/cyan]                                          — write state JSON for all devices\n"
+        "  [cyan]status()[/cyan]                                            — show connection status\n"
+        "  [cyan]creds()[/cyan]                                             — print all MQTT credentials\n"
+        "  [cyan]debug(on=True)[/cyan]                                      — toggle DEBUG logging on terminal\n"
+        "  [cyan]listen(on=True)[/cyan]                                     — stop/resume MQTT polling on all devices\n"
+        f"  [cyan]loop[/cyan]                                                — main asyncio event loop\n"
         f"\n  Output → [dim]{OUTPUT_DIR}[/dim]\n"
     )
 

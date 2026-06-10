@@ -12,8 +12,11 @@ a method on it.  All state (transports, rearm event, last-send timestamps,
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import TYPE_CHECKING
+
+from packaging.version import Version
 
 from pymammotion.device.ble_loop import _BLE_MODE_RECHECK_INTERVAL
 from pymammotion.device.modes import _DeviceMode
@@ -27,12 +30,24 @@ _logger = logging.getLogger(__name__)
 #: Activity-loop backoff when MQTT is rate-limited and no BLE is available.
 _RATE_LIMITED_BACKOFF: float = 43200.0  # 12 hours
 
+RATE_LIMIT_REMOVED_VERSION = Version("1.30.25.1")
+
 #: MQTT one-shot (count=1) poll cadence per device mode.  Tuned for cloud quotas.
+#: Each entry can be overridden at process startup via an environment variable:
+#: MAMMOTION_POLL_ACTIVE_SECS, MAMMOTION_POLL_DOCKED_CHARGING_SECS,
+#: MAMMOTION_POLL_DOCKED_FULL_SECS, MAMMOTION_POLL_IDLE_SECS
 _MQTT_POLL_INTERVAL: dict[_DeviceMode, float] = {
-    _DeviceMode.ACTIVE: 20 * 60.0,
-    _DeviceMode.DOCKED_CHARGING: 30 * 60.0,
-    _DeviceMode.DOCKED_FULL: 60 * 60.0,
-    _DeviceMode.IDLE: 15 * 60.0,
+    _DeviceMode.ACTIVE: float(os.environ.get("MAMMOTION_POLL_ACTIVE_SECS", 15 * 60)),
+    _DeviceMode.DOCKED_CHARGING: float(os.environ.get("MAMMOTION_POLL_DOCKED_CHARGING_SECS", 30 * 60)),
+    _DeviceMode.DOCKED_FULL: float(os.environ.get("MAMMOTION_POLL_DOCKED_FULL_SECS", 60 * 60)),
+    _DeviceMode.IDLE: float(os.environ.get("MAMMOTION_POLL_IDLE_SECS", 15 * 60)),
+}
+
+_MQTT_NEW_POLL_INTERVAL: dict[_DeviceMode, float] = {
+    _DeviceMode.ACTIVE: float(os.environ.get("MAMMOTION_POLL_ACTIVE_SECS", 10 * 60)),
+    _DeviceMode.DOCKED_CHARGING: float(os.environ.get("MAMMOTION_POLL_DOCKED_CHARGING_SECS", 5 * 60)),
+    _DeviceMode.DOCKED_FULL: float(os.environ.get("MAMMOTION_POLL_DOCKED_FULL_SECS", 60 * 60)),
+    _DeviceMode.IDLE: float(os.environ.get("MAMMOTION_POLL_IDLE_SECS", 10 * 60)),
 }
 
 
@@ -41,7 +56,13 @@ def poll_interval(handle: DeviceHandle) -> float:
 
     See ``_MQTT_POLL_INTERVAL`` for the per-mode cadence table.
     """
-    return _MQTT_POLL_INTERVAL[handle._device_mode()]  # noqa: SLF001
+
+    version = handle.snapshot.raw.update_check.current_version
+
+    if Version(version) >= RATE_LIMIT_REMOVED_VERSION:
+        return _MQTT_NEW_POLL_INTERVAL[handle.device_mode()]
+
+    return _MQTT_POLL_INTERVAL[handle.device_mode()]
 
 
 async def mqtt_activity_loop(handle: DeviceHandle) -> None:
@@ -56,7 +77,7 @@ async def mqtt_activity_loop(handle: DeviceHandle) -> None:
     * **DOCKED_FULL**    — 60 min (docked, battery 100%).
     * **IDLE**           — 15 min (paused/locked/lost).
 
-    While ``handle._ble_stream_active`` is True the BLE polling loop is feeding
+    While ``handle.ble_stream_active`` is True the BLE polling loop is feeding
     a continuous count=0 stream and this loop defers entirely; the BLE
     availability handler clears the flag and rearms us on disconnect.
 
@@ -73,8 +94,8 @@ async def mqtt_activity_loop(handle: DeviceHandle) -> None:
 
         # While the BLE polling loop owns a continuous stream, this loop
         # has nothing useful to do — fresh state is arriving over BLE.
-        if handle._ble_stream_active:  # noqa: SLF001
-            await handle._sleep_or_rearm(_BLE_MODE_RECHECK_INTERVAL)  # noqa: SLF001
+        if handle.ble_stream_active:
+            await handle.sleep_or_rearm(_BLE_MODE_RECHECK_INTERVAL)
             continue
 
         # No usable transport (cloud reported device offline + no BLE,
@@ -89,7 +110,7 @@ async def mqtt_activity_loop(handle: DeviceHandle) -> None:
                 handle._availability.mqtt_reported_offline,  # noqa: SLF001
                 interval,
             )
-            await handle._sleep_or_rearm(interval)  # noqa: SLF001
+            await handle.sleep_or_rearm(interval)
             continue
 
         # Timer: the later of "last data received" and "last poll sent".
@@ -102,7 +123,7 @@ async def mqtt_activity_loop(handle: DeviceHandle) -> None:
         wait = interval - (time.monotonic() - last_activity)
 
         if wait > 0:
-            if await handle._sleep_or_rearm(wait):  # noqa: SLF001
+            if await handle.sleep_or_rearm(wait):
                 continue  # rearmed by user command — re-evaluate immediately
             last_recv = max(
                 (t.last_received_monotonic for t in handle._transports.values()),  # noqa: SLF001
@@ -113,7 +134,7 @@ async def mqtt_activity_loop(handle: DeviceHandle) -> None:
                 continue
 
         if not handle._transports:  # noqa: SLF001
-            await handle._sleep_or_rearm(interval)  # noqa: SLF001
+            await handle.sleep_or_rearm(interval)
             continue
 
         # Back off if MQTT is rate-limited and no BLE transport is connected.
@@ -131,12 +152,12 @@ async def mqtt_activity_loop(handle: DeviceHandle) -> None:
                     handle.device_name,
                     _RATE_LIMITED_BACKOFF / 3600,
                 )
-                await handle._sleep_or_rearm(_RATE_LIMITED_BACKOFF)  # noqa: SLF001
+                await handle.sleep_or_rearm(_RATE_LIMITED_BACKOFF)
                 continue
 
-        if handle.queue.is_saga_active or handle._in_no_request_mode():  # noqa: SLF001
+        if handle.queue.is_saga_active or handle.in_no_request_mode():
             _logger.debug("poll_loop [%s]: saga active or no-request mode — deferring", handle.device_name)
-            await handle._sleep_or_rearm(interval)  # noqa: SLF001
+            await handle.sleep_or_rearm(interval)
             continue
 
         _logger.debug(

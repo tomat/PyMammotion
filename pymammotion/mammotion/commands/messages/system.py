@@ -1,9 +1,11 @@
 # === sendOrderMsg_Sys ===
 from abc import ABC
+import dataclasses
 import datetime
 import time
 
 from pymammotion import logger
+from pymammotion.data.model.pool_state import PoolPlan
 from pymammotion.mammotion.commands.abstract_message import AbstractMessage
 from pymammotion.proto import (
     AckToAppTypeE,
@@ -26,6 +28,7 @@ from pymammotion.proto import (
     MsgAttr,
     MsgCmdType,
     MsgDevice,
+    PlanJobSet,
     PoolBottomTypeE,
     QcAppTestId,
     RemoteResetReqT,
@@ -33,6 +36,7 @@ from pymammotion.proto import (
     RptAct,
     RptInfoType,
     RtkUsedType,
+    SpinoCtrl,
     SysCommCmd,
     SysKnifeControl,
     SysSetDateTime,
@@ -116,10 +120,9 @@ class MessageSystem(AbstractMessage, ABC):
 
         """
         seconds = hours * 3600  # Convert hours to seconds
-        mctlsys = MctlSys()
-        build = mctlsys.blade_used_warn_time = UserSetBladeUsedWarnTime(blade_used_warn_time=seconds)
+        mctlsys = MctlSys(blade_used_warn_time=UserSetBladeUsedWarnTime(blade_used_warn_time=seconds))
         logger.debug(f"Send command - set blade replacement warning time: hours={hours}, seconds={seconds}")
-        return self.send_order_msg_sys(build)
+        return self.send_order_msg_sys(mctlsys)
 
     def get_device_product_model(self) -> bytes:
         """Request the device product type and model information."""
@@ -161,7 +164,7 @@ class MessageSystem(AbstractMessage, ABC):
     def read_and_set_rtk_paring_code(self, op: int, cgf: str | None = None) -> bytes:
         """Read or write the RTK base station LoRa pairing code configuration."""
         logger.debug(f"Send read and write base station configuration quality op:{op}, cgf:{cgf}")
-        return self.send_order_msg_sys(MctlSys(todev_lora_cfg_req=LoraCfgReq(op=op, cfg=cgf)))
+        return self.send_order_msg_sys(MctlSys(todev_lora_cfg_req=LoraCfgReq(op=op, cfg=cgf or "")))
 
     def allpowerfull_rw(self, rw_id: int, context: int, rw: int) -> bytes:
         """Send a general-purpose bidirectional read/write command to the device by ID, context, and direction."""
@@ -253,7 +256,7 @@ class MessageSystem(AbstractMessage, ABC):
                 hours=i5,
                 minutes=i6,
                 seconds=i7,
-                time_zone=i8,
+                time_zone=int(i8),
                 daylight=i9,
             )
         )
@@ -296,7 +299,7 @@ class MessageSystem(AbstractMessage, ABC):
                 count=count,
             )
         )
-        logger.debug(f"Send command==== IOT slim data Act {build.todev_report_cfg.act}")
+        logger.debug(f"Send command==== IOT slim data Act {build.todev_report_cfg.act}")  # type: ignore
         return self.send_order_msg_sys_legacy(build)
 
     def get_maintenance(self) -> bytes:
@@ -317,24 +320,22 @@ class MessageSystem(AbstractMessage, ABC):
     def get_report_cfg_stop(self, timeout: int = 10000, period: int = 1000, no_change_period: int = 1000) -> bytes:
         """Send a command to stop all active IoT status reporting subscriptions on the device."""
         # TODO use send_order_msg_sys_legacy
-        mctl_sys = MctlSys(
-            todev_report_cfg=ReportInfoCfg(
-                act=RptAct.RPT_STOP,
-                timeout=timeout,
-                period=period,
-                no_change_period=no_change_period,
-                count=1,
-            )
+        report_cfg = ReportInfoCfg(
+            act=RptAct.RPT_STOP,
+            timeout=timeout,
+            period=period,
+            no_change_period=no_change_period,
+            count=0,
         )
-
-        mctl_sys.todev_report_cfg.sub.append(RptInfoType.RIT_CONNECT)
-        mctl_sys.todev_report_cfg.sub.append(RptInfoType.RIT_RTK)
-        mctl_sys.todev_report_cfg.sub.append(RptInfoType.RIT_DEV_LOCAL)
-        mctl_sys.todev_report_cfg.sub.append(RptInfoType.RIT_WORK)
-        mctl_sys.todev_report_cfg.sub.append(RptInfoType.RIT_DEV_STA)
-        mctl_sys.todev_report_cfg.sub.append(RptInfoType.RIT_VISION_POINT)
-        mctl_sys.todev_report_cfg.sub.append(RptInfoType.RIT_VIO)
-        mctl_sys.todev_report_cfg.sub.append(RptInfoType.RIT_VISION_STATISTIC)
+        report_cfg.sub.append(RptInfoType.RIT_CONNECT)
+        report_cfg.sub.append(RptInfoType.RIT_RTK)
+        report_cfg.sub.append(RptInfoType.RIT_DEV_LOCAL)
+        report_cfg.sub.append(RptInfoType.RIT_WORK)
+        report_cfg.sub.append(RptInfoType.RIT_DEV_STA)
+        report_cfg.sub.append(RptInfoType.RIT_VISION_POINT)
+        report_cfg.sub.append(RptInfoType.RIT_VIO)
+        report_cfg.sub.append(RptInfoType.RIT_VISION_STATISTIC)
+        mctl_sys = MctlSys(todev_report_cfg=report_cfg)
 
         luba_msg = LubaMsg(
             msgtype=MsgCmdType.EMBED_SYS,
@@ -354,7 +355,7 @@ class MessageSystem(AbstractMessage, ABC):
         self,
         timeout: int = 10000,
         period: int = 1000,
-        no_change_period: int = 2000,
+        no_change_period: int = 4000,
         count: int = 1,
     ) -> bytes:
         """Start full-status IoT reporting covering connectivity, RTK, work, vision, and base station info.
@@ -395,26 +396,68 @@ class MessageSystem(AbstractMessage, ABC):
         mowing are a separate always-on channel (not controlled by this cfg).
         """
         # TODO use send_order_msg_sys_legacy
-        mctl_sys = MctlSys(
-            todev_report_cfg=ReportInfoCfg(
-                act=RptAct.RPT_START,
-                timeout=timeout,
-                period=period,
-                no_change_period=no_change_period,
-                count=count,
-            )
+        report_cfg = ReportInfoCfg(
+            act=RptAct.RPT_START,
+            timeout=timeout,
+            period=period,
+            no_change_period=no_change_period,
+            count=count,
         )
+        report_cfg.sub.append(RptInfoType.RIT_CONNECT)
+        report_cfg.sub.append(RptInfoType.RIT_RTK)
+        report_cfg.sub.append(RptInfoType.RIT_DEV_LOCAL)
+        report_cfg.sub.append(RptInfoType.RIT_WORK)
+        report_cfg.sub.append(RptInfoType.RIT_DEV_STA)
+        report_cfg.sub.append(RptInfoType.RIT_VISION_POINT)
+        report_cfg.sub.append(RptInfoType.RIT_VIO)
+        report_cfg.sub.append(RptInfoType.RIT_VISION_STATISTIC)
+        report_cfg.sub.append(RptInfoType.RIT_BASESTATION_INFO)
+        report_cfg.sub.append(RptInfoType.RIT_FW_INFO)
+        mctl_sys = MctlSys(todev_report_cfg=report_cfg)
 
-        mctl_sys.todev_report_cfg.sub.append(RptInfoType.RIT_CONNECT)
-        mctl_sys.todev_report_cfg.sub.append(RptInfoType.RIT_RTK)
-        mctl_sys.todev_report_cfg.sub.append(RptInfoType.RIT_DEV_LOCAL)
-        mctl_sys.todev_report_cfg.sub.append(RptInfoType.RIT_WORK)
-        mctl_sys.todev_report_cfg.sub.append(RptInfoType.RIT_DEV_STA)
-        mctl_sys.todev_report_cfg.sub.append(RptInfoType.RIT_VISION_POINT)
-        mctl_sys.todev_report_cfg.sub.append(RptInfoType.RIT_VIO)
-        mctl_sys.todev_report_cfg.sub.append(RptInfoType.RIT_VISION_STATISTIC)
-        mctl_sys.todev_report_cfg.sub.append(RptInfoType.RIT_BASESTATION_INFO)
-        mctl_sys.todev_report_cfg.sub.append(RptInfoType.RIT_FW_INFO)
+        luba_msg = LubaMsg(
+            msgtype=MsgCmdType.EMBED_SYS,
+            sender=MsgDevice.DEV_MOBILEAPP,
+            rcver=MsgDevice.DEV_MAINCTL,
+            msgattr=MsgAttr.REQ,
+            seqs=self.seqs.increment_and_get() & 255,
+            version=1,
+            subtype=self.user_account,
+            sys=mctl_sys,
+            timestamp=round(time.time() * 1000),
+        )
+        return bytes(luba_msg.SerializeToString())
+
+    def get_report_cfg_spino(
+        self,
+        count: int = 1,
+        timeout: int = 10000,
+        period: int = 1000,
+        no_change_period: int = 4000,
+    ) -> bytes:
+        """Start status reporting for a Spino pool cleaner.
+
+        Pool cleaners only surface ``RIT_DEV_STA`` (``dev_statue_t`` → sys_status
+        / work_mode / battery, applied by ``PoolStateReducer``) plus
+        ``RIT_CONNECT`` for connectivity.  The mower-only channels (RTK, WORK,
+        VISION, BASESTATION, …) don't apply, so the subscription is deliberately
+        minimal — this mirrors the APK's ``requestHomeConnectStatus``
+        (``{RIT_CONNECT, RIT_DEV_STA}``).
+
+        ``count=0`` streams continuously until ``get_report_cfg_stop``; the
+        default ``count=1`` is a one-shot poll (used by the refresh-status
+        button). See :meth:`get_report_cfg` for the full field reference.
+        """
+        report_cfg = ReportInfoCfg(
+            act=RptAct.RPT_START,
+            timeout=timeout,
+            period=period,
+            no_change_period=no_change_period,
+            count=count,
+        )
+        report_cfg.sub.append(RptInfoType.RIT_CONNECT)
+        report_cfg.sub.append(RptInfoType.RIT_DEV_STA)
+        mctl_sys = MctlSys(todev_report_cfg=report_cfg)
 
         luba_msg = LubaMsg(
             msgtype=MsgCmdType.EMBED_SYS,
@@ -638,3 +681,117 @@ class MessageSystem(AbstractMessage, ABC):
         build = MctlSys(task_report_resp=FileTransferResponse(biz_id=biz_id, result=result, progress=progress))
         logger.debug(f"Send command - Confirm report biz_id={biz_id}, result={result}, progress={progress}")
         return self.send_order_msg_sys(build)
+
+    # ==================================================================
+    # Spino schedule plan CRUD — wraps ``SpinoCtrl(plan_job_set=...)``
+    # in ``LubaMsg.ctrl`` (msgtype = MSG_CMD_TYPE_SPINO_CTRL).  See
+    # ``docs/tasks_and_schedules.md`` § 2 for the wire protocol.
+    # ==================================================================
+
+    def send_order_spino_ctrl(self, ctrl: SpinoCtrl) -> bytes:
+        """Serialise a ``SpinoCtrl`` payload as a LubaMsg request (msgtype=253).
+
+        Mirrors the APK helper ``sendOrderSpino_Ctrl``
+        (``command/app/MACommandApiHelper.java:342-345``) — the Spino plan
+        path uses its own envelope distinct from ``EMBED_SYS``.
+        """
+        luba_msg = LubaMsg(
+            msgtype=MsgCmdType.SPINO_CTRL,
+            msgattr=MsgAttr.REQ,
+            sender=MsgDevice.DEV_MOBILEAPP,
+            rcver=MsgDevice.DEV_MAINCTL,
+            seqs=self.seqs.increment_and_get() & 255,
+            version=1,
+            subtype=self.user_account,
+            ctrl=ctrl,
+            timestamp=round(time.time() * 1000),
+        )
+        return bytes(luba_msg.SerializeToString())
+
+    @staticmethod
+    def _pool_plan_to_proto(plan: PoolPlan, cmd: int) -> PlanJobSet:
+        """Encode a ``PoolPlan`` to the wire proto with the right ``cmd``.
+
+        Crucially, the wire ``enable`` field is INVERTED: ``0 == enabled,
+        1 == disabled``.  Keep that inversion strictly inside this helper
+        so ``PoolPlan.enabled`` is a natural ``bool`` everywhere else.
+        """
+        return PlanJobSet(
+            cmd=cmd,
+            work_mode=plan.work_mode,
+            sub_mode=list(plan.sub_mode),
+            userid=plan.userid,
+            deviceid=plan.deviceid,
+            starttime=plan.starttime,
+            totalplannum=plan.totalplannum,
+            planindex=plan.planindex,
+            result=plan.result,
+            speed=plan.speed,
+            operating_power=plan.operating_power,
+            jobname=plan.jobname,
+            jobid=plan.jobid,
+            startdate=plan.startdate,
+            enddate=plan.enddate,
+            triggertype=plan.triggertype,
+            day=plan.day,
+            weeks=list(plan.weeks),
+            remained_seconds=plan.remained_seconds,
+            enable=0 if plan.enabled else 1,
+        )
+
+    def _send_spino_plan(self, plan: PoolPlan, cmd: int) -> bytes:
+        """Internal: build a full-plan SpinoCtrl frame with the given ``cmd``."""
+        wire = self._pool_plan_to_proto(plan, cmd)
+        return self.send_order_spino_ctrl(SpinoCtrl(plan_job_set=wire))
+
+    def read_spino_plan(self, plan_index: int = 0) -> bytes:
+        """Read one Spino plan by index (``cmd = QUERY = 2``).
+
+        The fetch saga loops ``plan_index`` 0..total_plan_num−1; the device
+        replies with one ``plan_job_set`` per index.
+        """
+        return self.send_order_spino_ctrl(
+            SpinoCtrl(plan_job_set=PlanJobSet(cmd=2, planindex=plan_index)),
+        )
+
+    def create_spino_plan(self, plan: PoolPlan) -> bytes:
+        """Create a new Spino plan (``cmd = ADD = 1``).
+
+        ``plan.jobid`` MUST be a fresh 64-bit id — re-using an existing
+        jobid would be treated as an edit by the device.
+        """
+        return self._send_spino_plan(plan, cmd=1)
+
+    def edit_spino_plan(self, plan: PoolPlan) -> bytes:
+        """Edit an existing Spino plan (``cmd = EDIT = 4``)."""
+        return self._send_spino_plan(plan, cmd=4)
+
+    def delete_spino_plan(self, jobid: int) -> bytes:
+        """Delete the Spino plan identified by ``jobid`` (``cmd = DELETE = 3``)."""
+        return self.send_order_spino_ctrl(
+            SpinoCtrl(plan_job_set=PlanJobSet(cmd=3, jobid=jobid)),
+        )
+
+    def delete_all_spino_plans(self) -> bytes:
+        """Wipe every Spino plan on the device (``cmd = DELETE_ALL = 5``)."""
+        return self.send_order_spino_ctrl(
+            SpinoCtrl(plan_job_set=PlanJobSet(cmd=5)),
+        )
+
+    def enable_spino_plan(self, plan: PoolPlan, enabled: bool) -> bytes:
+        """Toggle a Spino plan's enable flag (resent as ``cmd = EDIT = 4``)."""
+        return self.edit_spino_plan(plan.with_enabled(enabled))
+
+    def rename_spino_plan(self, plan: PoolPlan, new_name: str) -> bytes:
+        """Rename a Spino plan (resent as ``cmd = EDIT = 4``)."""
+        return self.edit_spino_plan(plan.with_renamed(new_name))
+
+    def copy_spino_plan(self, plan: PoolPlan, new_name: str, new_jobid: int) -> bytes:
+        """Duplicate *plan* under a new jobid + name (``cmd = ADD = 1``).
+
+        Caller supplies ``new_jobid`` (a fresh 64-bit int — generate with
+        ``secrets.randbits(63) | 1``) and ``new_name`` (e.g. via
+        :func:`pymammotion.utility.plan_id.make_copy_name`).
+        """
+        clone = dataclasses.replace(plan, jobid=new_jobid, jobname=new_name)
+        return self.create_spino_plan(clone)

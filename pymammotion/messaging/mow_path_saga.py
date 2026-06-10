@@ -57,6 +57,7 @@ class MowPathSaga(Saga):
         *,
         skip_planning: bool = False,
         device_name: str = "",
+        sync_type: int = 3,
     ) -> None:
         """Initialise the saga.
 
@@ -82,6 +83,7 @@ class MowPathSaga(Saga):
         self._route_info = route_info
         self._skip_planning = skip_planning
         self._device_name = device_name
+        self._sync_type = sync_type  # 2 = BLE, 3 = IoT/MQTT
         self.result: dict[int, dict[int, MowPath]] = {}
         self._route_val: GenerateRouteInformation | None = (
             route_info  # persists across retries to skip step 2 if already fetched
@@ -90,26 +92,22 @@ class MowPathSaga(Saga):
     async def _run(self, broker: DeviceMessageBroker) -> None:
         """Execute all saga steps."""
         self.result = {}
-        self._get_map().current_mow_path = {}
+        # Do NOT wipe current_mow_path here — invalidate_mow_path() handles
+        # clearing the cache when the device reports path_hash 0/1.  Wiping here
+        # defeats the per-hash skip logic below and forces a full re-fetch on
+        # every retry, mirroring what the APK's HashDataManager avoids.
 
         # start with ble sync
-        cmd = self._command_builder.send_todev_ble_sync(sync_type=3)
+        cmd = self._command_builder.send_todev_ble_sync(sync_type=self._sync_type)
         await self._send_command(cmd)
 
         # ------------------------------------------------------------------
         # Step 1: Request the line hash list (sub_cmd=3), collect all frames,
         # send get_hash_response acks for each.
         # ------------------------------------------------------------------
-        hash_ack_queue: asyncio.Queue[Any] = asyncio.Queue()
-
-        async def _collect_hash_ack(msg: Any) -> None:
-            frame = self.extract_nav_frame(msg, "toapp_gethash_ack")
-            if frame is not None and frame[1].sub_cmd == 3:
-                hash_ack_queue.put_nowait(msg)
-
         _current_frame = 1
         _total_frame = 0
-        with broker.subscribe_unsolicited(_collect_hash_ack):
+        with self._collect_frames(broker, "toapp_gethash_ack", lambda v: v.sub_cmd == 3) as hash_ack_queue:
             _logger.debug("MowPathSaga: requesting line hash list (sub_cmd=3)")
             cmd = self._command_builder.get_all_boundary_hash_list(sub_cmd=3)
             await self._send_command(cmd)
@@ -119,17 +117,21 @@ class MowPathSaga(Saga):
                     ack_response = await asyncio.wait_for(hash_ack_queue.get(), timeout=self.step_timeout)
                 except TimeoutError:
                     if _total_frame == 0:
+                        # Device gave no response at all — no active breakpoint lines.
+                        # Treat as empty and fall through to the zone_hashs fallback
+                        # at the sub_cmd=3 check below.
                         _logger.warning(
-                            "collecting mow path [%s]: no response to line hash list request (sub_cmd=3)",
+                            "collecting mow path [%s]: no response to line hash list request (sub_cmd=3)"
+                            " — treating as empty and continuing",
                             self._device_name,
                         )
-                    else:
-                        _logger.warning(
-                            "collecting mow path [%s]: line hash list interrupted at frame %d/%d",
-                            self._device_name,
-                            _current_frame,
-                            _total_frame,
-                        )
+                        break
+                    _logger.warning(
+                        "collecting mow path [%s]: line hash list interrupted at frame %d/%d",
+                        self._device_name,
+                        _current_frame,
+                        _total_frame,
+                    )
                     raise CommandTimeoutError("toapp_gethash_ack(sub_cmd=3)", 1) from None
 
                 ack = ack_response.nav.toapp_gethash_ack
@@ -163,6 +165,7 @@ class MowPathSaga(Saga):
                     send_timeout=self.step_timeout,
                 )
                 _, self._route_val = betterproto2.which_one_of(response.nav, "SubNavMsg")
+                assert self._route_val is not None
                 _logger.debug(
                     "MowPathSaga: route confirmed — sub_cmd=%d  path_hash=%d",
                     self._route_val.sub_cmd,
@@ -181,22 +184,34 @@ class MowPathSaga(Saga):
         # Combine all frames' hashes into one flat list, then split into batches of 20.
         _sub3 = next((r for r in self._get_map().root_hash_lists if r.sub_cmd == 3), None)
         if _sub3 is None or not _sub3.data:
-            confirmed_zone_hashs = (
-                [h for h in self._route_val.zone_hashs if h != 0] if self._route_val is not None else []
-            ) or self._zone_hashs
-            _logger.warning(
-                "MowPathSaga: no sub_cmd=3 hash list in map — falling back to zone_hashs=%s",
-                confirmed_zone_hashs,
+            # No breakpoint lines from sub_cmd=3 — nothing to fetch via get_line_info_list.
+            _logger.debug("MowPathSaga: no sub_cmd=3 line hashes — no cover path to fetch")
+            self._route_val = None
+            return
+        all_hashes = [
+            h for frame in sorted(_sub3.data, key=lambda d: d.current_frame) for h in frame.data_couple if h != 0
+        ]
+        _logger.debug("MowPathSaga: %d total hash(es) from map", len(all_hashes))
+
+        # Skip hashes whose cover-path data is already cached in current_mow_path,
+        # matching the APK's getHashLineNew() per-hash DB check (HashDataManager line 470).
+        current_map = self._get_map()
+        missing_hashes = [h for h in all_hashes if not current_map.has_mow_path_for_hash(h)]
+        if not missing_hashes:
+            _logger.debug("MowPathSaga: all %d hash(es) already cached — skipping fetch", len(all_hashes))
+            self.result = current_map.current_mow_path
+            return
+
+        if len(missing_hashes) < len(all_hashes):
+            _logger.debug(
+                "MowPathSaga: %d/%d hash(es) already cached — fetching %d missing",
+                len(all_hashes) - len(missing_hashes),
+                len(all_hashes),
+                len(missing_hashes),
             )
-            all_hashes = confirmed_zone_hashs
-        else:
-            all_hashes = [
-                h for frame in sorted(_sub3.data, key=lambda d: d.current_frame) for h in frame.data_couple if h != 0
-            ]
-            _logger.debug("MowPathSaga: %d total hash(es) from map", len(all_hashes))
 
         _BATCH_SIZE = 20
-        hash_batches = [all_hashes[i : i + _BATCH_SIZE] for i in range(0, len(all_hashes), _BATCH_SIZE)]
+        hash_batches = [missing_hashes[i : i + _BATCH_SIZE] for i in range(0, len(missing_hashes), _BATCH_SIZE)]
         _logger.debug(
             "MowPathSaga: %d batch(es) of up to %d hash(es) each",
             len(hash_batches),
@@ -207,12 +222,6 @@ class MowPathSaga(Saga):
         # Step 3–4: For each batch of up to 20 hashes, request cover paths and
         # collect all cover_path_upload frames before moving to the next batch.
         # ------------------------------------------------------------------
-        path_queue: asyncio.Queue[Any] = asyncio.Queue()
-
-        async def _collect_path(msg: Any) -> None:
-            if self.extract_nav_frame(msg, "cover_path_upload") is not None:
-                path_queue.put_nowait(msg)
-
         current_run_tx_ids: set[int] = set()
 
         _NO_PROGRESS_LIMIT = 10
@@ -220,7 +229,7 @@ class MowPathSaga(Saga):
         def _missing_frame_count() -> int:
             return sum(len(v) for v in self._get_map().find_missing_mow_path_frames().values())
 
-        with broker.subscribe_unsolicited(_collect_path):
+        with self._collect_frames(broker, "cover_path_upload") as path_queue:
             for batch_idx, batch_hashes in enumerate(hash_batches):
                 transaction_id = int(time.time() * 1000)
                 current_run_tx_ids.add(transaction_id)
@@ -242,12 +251,10 @@ class MowPathSaga(Saga):
                 no_progress = 0
 
                 while True:
-                    try:
-                        frame_response = await asyncio.wait_for(path_queue.get(), timeout=self.step_timeout)
-                    except TimeoutError:
-                        raise CommandTimeoutError("cover_path_upload", 1) from None
+                    frame_response = await self._next_frame(path_queue, "cover_path_upload")
 
                     _, path_val = betterproto2.which_one_of(frame_response.nav, "SubNavMsg")
+                    assert path_val is not None
                     mow_path = MowPath.from_dict(path_val.to_dict(casing=betterproto2.Casing.SNAKE))
 
                     if mow_path.transaction_id not in current_run_tx_ids:

@@ -26,8 +26,10 @@ from typing import TYPE_CHECKING
 import aiomqtt
 from Tea.exceptions import UnretryableException
 
+from pymammotion.aliyun.exceptions import DeviceUnboundException
 from pymammotion.data.mqtt.status import ThingStatusMessage
 from pymammotion.transport.base import (
+    AccountInUseError,
     ReLoginRequiredError,
     SessionExpiredError,
     Transport,
@@ -215,8 +217,14 @@ class AliyunMQTTTransport(Transport):
         """Start the Aliyun MQTT receive loop task.
 
         Does nothing if the task is already running (connected or in a retry-sleep).
-        If the task has died unexpectedly it is restarted.
+        If the task has died unexpectedly it is restarted.  Refuses to start once
+        the re-login circuit breaker has tripped — otherwise queued
+        ``call_soon(connect())`` callbacks from earlier ``_on_fatal_auth`` cycles
+        would resurrect the loop indefinitely.
         """
+        if self._unrecoverable_auth_failure:
+            _logger.debug("AliyunMQTTTransport.connect() called after unrecoverable auth failure — refusing")
+            return
         if self._task is not None and not self._task.done():
             _logger.debug(
                 "AliyunMQTTTransport.connect() called while task is running (availability=%s) — ignoring",
@@ -249,11 +257,16 @@ class AliyunMQTTTransport(Transport):
         except UnretryableException as ex:
             self.record_error()
             raise TransportError(ex.message) from None
+        except DeviceUnboundException:
+            # The device is unbound from this account — not a fault of the shared
+            # connection, so don't count it against transport health.  The handle
+            # detaches Aliyun and triggers migration/removal.
+            raise
         except Exception:
             self.record_error()
             raise
 
-    async def send(self, payload: bytes, iot_id: str = "") -> None:
+    async def send(self, payload: bytes, iot_id: str = "", firmware_version: str = "") -> None:
         """Send *payload* to the device and count it against the 24-hour quota."""
         if self.is_rate_limited:
             remaining = self._rate_limited_until - time.monotonic()
@@ -370,6 +383,7 @@ class AliyunMQTTTransport(Transport):
                     keepalive=self._config.keepalive,
                     tls_context=_tls_context,
                     protocol=aiomqtt.ProtocolVersion.V311,
+                    timeout=60,
                     max_inflight_messages=_MQTT_MAX_INFLIGHT,
                     max_queued_incoming_messages=_MQTT_MAX_QUEUED,
                 ) as client:
@@ -404,6 +418,12 @@ class AliyunMQTTTransport(Transport):
                             await self._dispatch_device_status(topic, raw)
                         elif topic.endswith("/account/bind_reply"):
                             code = self._handle_bind_reply(raw)
+                            if code == 2152:
+                                raise AccountInUseError(
+                                    "",
+                                    "Account is already active in another session (distributed lock held). "
+                                    "Sign out of the Mammotion app or wait for the other session to expire.",
+                                )
                             if code == 2043:
                                 raise SessionExpiredError(
                                     TransportType.CLOUD_ALIYUN,
@@ -438,6 +458,10 @@ class AliyunMQTTTransport(Transport):
                     await self._handle_fatal_auth_error(fatal)
                     raise fatal from exc
                 _logger.warning("Aliyun MQTT error (rc=%s): %s — retry in %ds", rc, exc, backoff)
+            except AccountInUseError as exc:
+                _logger.error("Aliyun account in use elsewhere — cannot connect: %s", exc)
+                await self._handle_fatal_auth_error(exc)
+                raise
             except SessionExpiredError as exc:
                 _logger.warning("Aliyun bind token expired — attempting credential refresh: %s", exc)
                 if self.on_auth_failure is not None:
