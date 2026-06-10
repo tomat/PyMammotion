@@ -64,6 +64,8 @@ class MapFetchSaga(Saga):
         get_map: Callable[[], HashList],
         get_bol_hash: Callable[[], int] | None = None,
         sync_type: int = 3,
+        area_names_only: bool = False,
+        existing_area_hashes: list[int] | None = None,
     ) -> None:
         """Initialise the saga with device info and transport helpers.
 
@@ -76,6 +78,14 @@ class MapFetchSaga(Saga):
         (``report_data.locations[0].bol_hash``), used for the start-of-run
         staleness check.  Defaults to a getter that returns 0 (no check) so
         callers/tests that don't supply it behave as before.
+
+        When *area_names_only* is True the saga only executes step 1 (area
+        name fetch) and skips the expensive hash-list + chunk steps. Use this
+        when cached map data is still useful but area names were not populated.
+
+        *existing_area_hashes* is used in *area_names_only* mode: if the device
+        returns no names, fallback names "area 1", "area 2", ... are generated
+        from these hash IDs so Home Assistant still has display names.
         """
         self._device_id = device_id
         self._device_name = device_name
@@ -85,6 +95,8 @@ class MapFetchSaga(Saga):
         self._get_map = get_map
         self._get_bol_hash = get_bol_hash or (lambda: 0)
         self._sync_type = sync_type  # 2 = BLE, 3 = IoT/MQTT
+        self._area_names_only = area_names_only
+        self._existing_area_hashes: list[int] = existing_area_hashes or []
 
         # Result — set on success, None until then
         self.result: HashList | None = None
@@ -94,16 +106,17 @@ class MapFetchSaga(Saga):
         self.result = None
         self._reset_attempt_counter = False
 
-        # Start-of-run staleness check: if the device's reported bol_hash no longer
-        # matches our stored root manifest, the map was edited device-side since we
-        # last synced.  invalidate_maps() only wipes root_hash_lists when the hashes
-        # actually mismatch, so an in-sync map (or a mid-fetch resume) is left intact
-        # and only a genuinely stale manifest is dropped — forcing steps 2-3 to
-        # rebuild it to match the device's CURRENT boundary list.  Guard on a known
-        # (non-zero) bol_hash so a device that hasn't reported one yet is never wiped.
-        # This is the manual-"sync maps" safety net: the report-driven invalidate in
-        # MowingDevice already handles the watcher-triggered path.
-        self._get_map().invalidate_maps(self._get_bol_hash())
+        if not self._area_names_only:
+            # Start-of-run staleness check: if the device's reported bol_hash no longer
+            # matches our stored root manifest, the map was edited device-side since we
+            # last synced.  invalidate_maps() only wipes root_hash_lists when the hashes
+            # actually mismatch, so an in-sync map (or a mid-fetch resume) is left intact
+            # and only a genuinely stale manifest is dropped — forcing steps 2-3 to
+            # rebuild it to match the device's CURRENT boundary list.  Guard on a known
+            # (non-zero) bol_hash so a device that hasn't reported one yet is never wiped.
+            # This is the manual-"sync maps" safety net: the report-driven invalidate in
+            # MowingDevice already handles the watcher-triggered path.
+            self._get_map().invalidate_maps(self._get_bol_hash())
 
         cmd = self._command_builder.send_todev_ble_sync(sync_type=self._sync_type)
         await self._send_command(cmd)
@@ -133,7 +146,22 @@ class MapFetchSaga(Saga):
                 self._get_map().area_name = [
                     AreaHashNameList(name=item.name, hash=item.hash) for item in area_hash_name_msg.hashnames
                 ]
+            elif self._area_names_only and self._existing_area_hashes:
+                self._get_map().area_name = [
+                    AreaHashNameList(name=f"area {i + 1}", hash=h)
+                    for i, h in enumerate(sorted(self._existing_area_hashes))
+                ]
+                _logger.debug(
+                    "MapFetchSaga[%s]: device returned no area names — generated %d fallback name(s)",
+                    self._device_name,
+                    len(self._get_map().area_name),
+                )
             _logger.debug("MapFetchSaga[%s]: got %d area names", self._device_name, len(self._get_map().area_name))
+
+        if self._area_names_only:
+            _logger.debug("MapFetchSaga[%s]: area-names-only mode — skipping hash list fetch", self._device_name)
+            self.result = self._get_map()
+            return
 
         # ------------------------------------------------------------------
         # Steps 2-3: Root hash list frames.

@@ -112,6 +112,20 @@ async def test_update_availability_changes_state() -> None:
     assert handle.availability.connection_state == DeviceConnectionState.CONNECTED
 
 
+def test_fetch_gate_setters_change_runtime_flags() -> None:
+    """Runtime saga gates should be available to integrations."""
+    handle = make_handle()
+
+    assert handle.mow_path_fetch_enabled is True
+    assert handle.full_map_fetch_enabled is True
+
+    handle.set_mow_path_fetch_enabled(value=False)
+    handle.set_full_map_fetch_enabled(value=False)
+
+    assert handle.mow_path_fetch_enabled is False
+    assert handle.full_map_fetch_enabled is False
+
+
 # ---------------------------------------------------------------------------
 # test 4: stop cancels queue and broker
 # ---------------------------------------------------------------------------

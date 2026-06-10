@@ -9,7 +9,14 @@ import betterproto2
 from pymammotion.data.model.hash_list import HashList, NavGetCommData, NavGetHashListData
 from pymammotion.messaging.broker import DeviceMessageBroker
 from pymammotion.messaging.map_saga import MapFetchSaga
-from pymammotion.proto import LubaMsg, MctlNav, NavGetCommDataAck, NavGetHashListAck
+from pymammotion.proto import (
+    AppGetAllAreaHashName,
+    AreaHashName,
+    LubaMsg,
+    MctlNav,
+    NavGetCommDataAck,
+    NavGetHashListAck,
+)
 from tests.unit.messaging._helpers import make_command_builder as _make_command_builder
 
 
@@ -23,6 +30,18 @@ def _hash_list_msg(hash_ids: list[int]) -> LubaMsg:
                 total_frame=1,
                 current_frame=1,
                 data_couple=hash_ids,
+            )
+        )
+    )
+
+
+def _area_names_msg(device_id: str, names: list[tuple[int, str]]) -> LubaMsg:
+    """Build a LubaMsg carrying a toapp_all_hash_name response."""
+    return LubaMsg(
+        nav=MctlNav(
+            toapp_all_hash_name=AppGetAllAreaHashName(
+                device_id=device_id,
+                hashnames=[AreaHashName(hash=hash_id, name=name) for hash_id, name in names],
             )
         )
     )
@@ -98,6 +117,39 @@ async def _run_saga_with_messages(
 # ---------------------------------------------------------------------------
 # test 1 — known type (area=0): saga stores data and terminates normally
 # ---------------------------------------------------------------------------
+
+
+async def test_area_names_only_mode_skips_hash_list_fetch() -> None:
+    """Area-names-only mode should refresh names without requesting full map data."""
+    broker = DeviceMessageBroker()
+
+    async def send_command(cmd: bytes) -> None:
+        pass
+
+    _map = HashList()
+    cb = _make_command_builder()
+    saga = MapFetchSaga(
+        device_id="dev-names",
+        device_name="Yuka-Test",
+        is_luba1=False,
+        command_builder=cb,
+        send_command=send_command,
+        get_map=lambda: _map,
+        area_names_only=True,
+        existing_area_hashes=[111, 222],
+    )
+
+    await _run_saga_with_messages(
+        broker,
+        saga,
+        messages=[_area_names_msg("dev-names", [(111, "Front"), (222, "Back")])],
+    )
+
+    assert saga.result is _map
+    assert [(item.hash, item.name) for item in _map.area_name] == [(111, "Front"), (222, "Back")]
+    cb.get_area_name_list.assert_called_once_with("dev-names")
+    cb.get_all_boundary_hash_list.assert_not_called()
+    cb.synchronize_hash_data.assert_not_called()
 
 
 async def test_saga_terminates_with_known_type() -> None:

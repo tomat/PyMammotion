@@ -204,6 +204,7 @@ class DeviceHandle:
         self._sent_bus: EventBus[bytes] = EventBus()
         self._prefer_ble: bool = prefer_ble
         self._mow_path_fetch_enabled: bool = True
+        self._full_map_fetch_enabled: bool = True
         # Pick a reducer matching the device kind. PoolCleanerDevice instances
         # get a PoolStateReducer (currently a stub); everything else gets the
         # full mower reducer. Decided once at construction so the per-message
@@ -1788,6 +1789,15 @@ class DeviceHandle:
     def set_mow_path_fetch_enabled(self, *, value: bool) -> None:
         """Gate MowPathSaga fetches over MQTT. BLE fetches are never gated."""
         self._mow_path_fetch_enabled = value
+
+    @property
+    def full_map_fetch_enabled(self) -> bool:
+        """True if full MapFetchSaga geometry fetches are allowed over MQTT."""
+        return self._full_map_fetch_enabled
+
+    def set_full_map_fetch_enabled(self, *, value: bool) -> None:
+        """Gate full map fetches over MQTT. BLE fetches are never gated."""
+        self._full_map_fetch_enabled = value
 
     @property
     def ble_stream_active(self) -> bool:

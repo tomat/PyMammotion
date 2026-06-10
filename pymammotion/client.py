@@ -2043,6 +2043,15 @@ class MammotionClient:
 
         if handle := self._device_registry.get_by_name(device_name):
             commands = handle.commands
+            mqtt_only_run = not handle.is_transport_connected(TransportType.BLE)
+            area_names_only = mqtt_only_run and not handle.full_map_fetch_enabled
+            existing_area_hashes: list[int] | None = None
+            if area_names_only:
+                existing_area_hashes = sorted(cast(MowerDevice, handle.snapshot.raw).map.area.keys())
+                _logger.debug(
+                    "start_map_sync '%s': full_map_fetch_enabled=False over MQTT - area-names-only mode",
+                    device_name,
+                )
             saga = MapFetchSaga(
                 device_id=handle.device_id,
                 device_name=handle.device_name,
@@ -2054,6 +2063,8 @@ class MammotionClient:
                     locs[0].bol_hash if (locs := cast(MowerDevice, handle.snapshot.raw).report_data.locations) else 0
                 ),
                 sync_type=2 if handle.is_transport_connected(TransportType.BLE) else 3,
+                area_names_only=area_names_only,
+                existing_area_hashes=existing_area_hashes,
             )
 
             async def _on_map_complete() -> None:
@@ -2703,6 +2714,16 @@ class MammotionClient:
         handle = self._device_registry.get(device_id)
         if handle is not None:
             handle.set_mow_path_fetch_enabled(value=enabled)
+
+    def set_full_map_fetch_enabled(self, device_id: str, *, enabled: bool) -> None:
+        """Toggle the MQTT-side full map fetch gate for a registered device.
+
+        When False, MapFetchSaga runs in area-names-only mode for any send that
+        would go over MQTT. BLE-routed fetches always run the full sync.
+        """
+        handle = self._device_registry.get(device_id)
+        if handle is not None:
+            handle.set_full_map_fetch_enabled(value=enabled)
 
     # ------------------------------------------------------------------
     # Properties
