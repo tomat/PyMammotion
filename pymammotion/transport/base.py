@@ -260,7 +260,7 @@ class Transport(ABC):
     #: Rolling window for the outbound send counter (24 hours).
     _SEND_WINDOW: float = 86400.0
     #: Maximum sends allowed within _SEND_WINDOW before self-imposing rate limiting.
-    _SEND_LIMIT: int = 600
+    _SEND_LIMIT: int = 1200
 
     def __init__(self) -> None:
         """Initialise the availability listener list and error window."""
