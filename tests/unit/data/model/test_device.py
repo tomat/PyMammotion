@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import json
+from typing import cast
 
 from pymammotion.data.model.device import MowingDevice
 from pymammotion.data.model.hash_list import FrameList, HashList, MowPath, NavGetCommData
+from pymammotion.http.model.http import ErrorInfo
+from pymammotion.proto import SystemUpdateBufMsg
 
 
 def _make_hash_list_with_int_keys() -> HashList:
@@ -49,6 +52,26 @@ def test_empty_mowing_device_roundtrip() -> None:
     assert json_str
     data = json.loads(json_str)
     assert data["name"] == "empty"
+
+
+def _error_buffer(*pairs: tuple[int, int]) -> SystemUpdateBufMsg:
+    data = [2, 0, 0]
+    for code, timestamp in pairs:
+        data.extend([code, timestamp])
+    while len(data) < 23:
+        data.extend([0, 0])
+    return SystemUpdateBufMsg(update_buf_data=data[:23])
+
+
+def test_error_buffer_prioritizes_known_error_slots() -> None:
+    device = MowingDevice(name="test-device")
+    device.errors.error_codes = cast(dict[str, ErrorInfo], {"1203": object()})
+
+    device.buffer(_error_buffer((8000033, 100), (1203, 200), (0, 0)))
+
+    assert device.errors.err_code_list[:3] == [1203, 8000033, 0]
+    assert device.errors.err_code_list_time[:3] == [200, 100, 0]
+    assert device.errors.error_pair() == (1203, 200)
 
 
 # ===========================================================================

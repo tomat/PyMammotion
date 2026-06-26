@@ -139,9 +139,7 @@ class MowerDevice(Device):
                     self.location.dock.rotation = buffer_list.update_buf_data[3]
 
             case 2:
-                self.errors.err_code_list.clear()
-                self.errors.err_code_list_time.clear()
-                self.errors.err_code_list.extend(
+                self.errors.set_error_pairs(
                     [
                         buffer_list.update_buf_data[3],
                         buffer_list.update_buf_data[5],
@@ -153,9 +151,7 @@ class MowerDevice(Device):
                         buffer_list.update_buf_data[17],
                         buffer_list.update_buf_data[19],
                         buffer_list.update_buf_data[21],
-                    ]
-                )
-                self.errors.err_code_list_time.extend(
+                    ],
                     [
                         buffer_list.update_buf_data[4],
                         buffer_list.update_buf_data[6],
