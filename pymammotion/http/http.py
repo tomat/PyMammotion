@@ -100,9 +100,7 @@ def sign_with_hmac_sha256(data: str, app_secret: str) -> str:
         digest = hmac_obj.digest()
 
         # Convert to hex string
-        hex_string = digest.hex()
-
-        return hex_string
+        return digest.hex()
 
     except Exception as e:
         raise RuntimeError(f"toSignWithHmacSha256 error: {e}") from e
@@ -315,7 +313,7 @@ class MammotionHTTP:
             if (resp.headers.get("Content-Type") or "").startswith("application/json"):
                 data = await resp.json()
                 reader = csv.DictReader(data.get("data", "").split("\n"), delimiter=",")
-                codes = dict()
+                codes = {}
                 for row in reader:
                     error_info = ErrorInfo(**cast(dict[str, Any], row))
                     codes[error_info.code] = error_info
@@ -471,12 +469,30 @@ class MammotionHTTP:
                     "Content-Type": "application/json",
                 },
             )
-            if (resp.headers.get("Content-Type") or "").startswith("application/json"):
-                data = await resp.json()
-                response = response_factory(Response[StreamSubscriptionResponse], data)
+            content_type = resp.headers.get("Content-Type") or ""
+            body = await resp.text()
+            _LOGGER.debug(
+                "stream/token response: status=%s content-type=%s body=%.500s",
+                resp.status,
+                content_type,
+                body,
+            )
+            if content_type.startswith("application/json"):
+                response = response_factory(Response[StreamSubscriptionResponse], json.loads(body))
+                if response.data is None:
+                    _LOGGER.warning(
+                        "stream/token returned JSON with no stream data (code=%s msg=%s)",
+                        response.code,
+                        response.msg,
+                    )
                 return response
 
-        return Response(code=200, msg="success")
+            _LOGGER.warning(
+                "stream/token returned non-JSON response (status=%s content-type=%s)",
+                resp.status,
+                content_type,
+            )
+            return Response(code=resp.status, msg="non-json response")
 
     @refresh_token_decorator
     async def get_video_resource(self, iot_id: str) -> Response[VideoResourceResponse]:
@@ -659,7 +675,7 @@ class MammotionHTTP:
     @retry_on_network_error
     @refresh_token_decorator
     async def get_mqtt_credentials(self) -> Response[MQTTConnection]:
-        """Get mammotion mqtt credentials"""
+        """Get mammotion mqtt credentials."""
         async with self._client_session() as session:
             resp = await session.post(
                 f"{self.jwt_info.iot}/v1/mqtt/auth/jwt",
@@ -774,7 +790,7 @@ class MammotionHTTP:
                 },
             )
             if resp.status != 200:
-                _LOGGER.debug("login_v2 failed (status=%s): %s", resp.status, resp.json())
+                _LOGGER.debug("login failed (status=%s): %s", resp.status, await resp.text())
                 return Response.from_dict({"code": resp.status, "msg": "Login failed"})
             data = await resp.json()
         login_response = response_factory(Response[LoginResponseData], data)

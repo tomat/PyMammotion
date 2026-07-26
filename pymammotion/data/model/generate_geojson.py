@@ -33,6 +33,7 @@ layer shape that the HA-Mammotion-Assets icon pack consumes.
 import json
 import logging
 import math
+from pathlib import Path
 from typing import Any, ClassVar
 
 from shapely.geometry import Point
@@ -272,6 +273,13 @@ TYPE_SVG: int = 13
 TYPE_VISUAL_SAFETY_ZONE: int = 25
 TYPE_VISUAL_OBSTACLE_ZONE: int = 26
 
+#: Type ids rendered as GeoJSON Polygons in ``_create_feature_geometry``.  Their
+#: device frames are closed rings but usually do NOT repeat the first point, so
+#: stats must include the implicit closing segment (perimeter) and the enclosed area.
+POLYGON_TYPE_IDS: frozenset[int] = frozenset(
+    {TYPE_MOWING_ZONE, TYPE_OBSTACLE, TYPE_VISUAL_SAFETY_ZONE, TYPE_VISUAL_OBSTACLE_ZONE}
+)
+
 # Coordinate conversion constants
 METERS_PER_DEGREE: int = 111320
 
@@ -296,7 +304,7 @@ class GeojsonGenerator:
 
     @staticmethod
     def apply_meter_offsets(lon: float, lat: float, lon_offset: float, lat_offset: float) -> list[float]:
-        """Apply meter-based offsets to coordinates (in degrees)"""
+        """Apply meter-based offsets to coordinates (in degrees)."""
         new_lon = lon + (lon_offset / (METERS_PER_DEGREE * math.cos(math.radians(lat))))
         new_lat = lat + (lat_offset / METERS_PER_DEGREE)
         return [new_lon, new_lat]
@@ -320,7 +328,7 @@ class GeojsonGenerator:
 
         geo_json: GeoJSONCollection = {"type": "FeatureCollection", "name": "Lawn Areas", "features": []}
         GeojsonGenerator._add_rtk_and_dock(rtk_location, dock_location, dock_rotation, geo_json)
-        total_frames = GeojsonGenerator._process_map_objects(hash_list, rtk_location, area_names, geo_json, yaw=yaw)
+        GeojsonGenerator._process_map_objects(hash_list, rtk_location, area_names, geo_json, yaw=yaw)
         GeojsonGenerator._process_svg_map_objects(hash_list, rtk_location, geo_json, yaw=yaw)
 
         # _save_geojson(geo_json)
@@ -331,7 +339,7 @@ class GeojsonGenerator:
         """Generate GeoJSON from hash list data."""
         geo_json: GeoJSONCollection = {"type": "FeatureCollection", "name": "Mowing Lawn Areas", "features": []}
 
-        total_frames = GeojsonGenerator._process_mow_map_objects(hash_list, rtk_location, geo_json, yaw=yaw)
+        GeojsonGenerator._process_mow_map_objects(hash_list, rtk_location, geo_json, yaw=yaw)
         return geo_json
 
     @staticmethod
@@ -493,7 +501,7 @@ class GeojsonGenerator:
         for path_hash in sorted(points_by_hash.keys(), key=_hash_order):
             all_points = points_by_hash[path_hash]
             total = len(all_points)
-            is_active = ub_path_hash == 0 or path_hash == ub_path_hash
+            is_active = ub_path_hash in (0, path_hash)
 
             if is_active:
                 if path_pos is not None and (path_pos[0] != 0.0 or path_pos[1] != 0.0):
@@ -634,7 +642,8 @@ class GeojsonGenerator:
                 total_frames += len(frame_list.data)
 
                 lonlat_coords = GeojsonGenerator._convert_to_lonlat_coords(local_coords, rtk_location, yaw=yaw)
-                length, area = GeojsonGenerator.map_object_stats(local_coords)
+                is_polygon = frame_list.data[0].type in POLYGON_TYPE_IDS
+                length, area = GeojsonGenerator.map_object_stats(local_coords, closed=is_polygon)
 
                 feature = GeojsonGenerator._create_feature(
                     hash_key,
@@ -668,7 +677,7 @@ class GeojsonGenerator:
         """
         total_frames = 0
 
-        for transaction_id, frames_by_index in hash_list.current_mow_path.items():
+        for frames_by_index in hash_list.current_mow_path.values():
             if not frames_by_index:
                 continue
 
@@ -706,7 +715,7 @@ class GeojsonGenerator:
         return total_frames
 
     @staticmethod
-    def _svg_bounding_box(svg: SvgMessage, yaw: float) -> list[CommDataCouple]:
+    def _svg_bounding_box(svg: SvgMessage, _yaw: float) -> list[CommDataCouple]:
         """Return the four corners of an SVG tile's rotated bounding box in device-local ENU metres.
 
         The box is centred at (x_move, y_move), has physical dimensions
@@ -918,7 +927,7 @@ class GeojsonGenerator:
     # ``{n}`` is the 1-based index within the type.
     # It is used when the device has no user label for this hash.
     _NAME_TEMPLATES: ClassVar[dict[str, str]] = {
-        "area": "Zone {n}",
+        "area": "Area {n}",
         "path": "Path {n}",
         "obstacle": "Obstacle {n}",
         "dump": "Dump zone {n}",
@@ -991,7 +1000,7 @@ class GeojsonGenerator:
 
     @staticmethod
     def _create_mow_path_feature(
-        path_packet_list: MowPath, path_type: int, lonlat_coords: CoordinateList, length: float, area: float
+        path_packet_list: MowPath, path_type: int, lonlat_coords: CoordinateList, length: float, _area: float
     ) -> GeoJSONFeature | None:
         """Create a GeoJSON feature for a mow path, styled by path_type.
 
@@ -1113,7 +1122,7 @@ class GeojsonGenerator:
             geoJSON: GeoJSON collection to save
 
         """
-        with open("areas.json", "w") as json_file:
+        with Path("areas.json").open("w") as json_file:
             json.dump(geoJSON, json_file, indent=2)
 
     @staticmethod
@@ -1144,11 +1153,15 @@ class GeojsonGenerator:
         return new_lon, new_lat
 
     @staticmethod
-    def map_object_stats(coords: list[CommDataCouple]) -> Coordinate:
+    def map_object_stats(coords: list[CommDataCouple], closed: bool = False) -> Coordinate:
         """Calculate length and area statistics for map object coordinates.
 
         Args:
             coords: List of coordinate dictionaries with 'x' and 'y' keys
+            closed: Treat *coords* as a closed ring even when the device did not
+                repeat the first point (Polygon-type map objects).  The implicit
+                closing segment is then included in the perimeter and the
+                enclosed area is computed.
 
         Returns:
             Tuple of (length, area) in meters and square meters
@@ -1164,14 +1177,16 @@ class GeojsonGenerator:
 
         length = sum(distance(coords[i], coords[i + 1]) for i in range(len(coords) - 1))
 
-        # Open line
+        ring = coords
         if coords[0] != coords[-1]:
-            return length, 0.0
+            # Open line — only a closed ring (explicit or declared) has an area.
+            if not closed:
+                return length, 0.0
+            length += distance(coords[-1], coords[0])
+            ring = [*coords, coords[0]]
 
         # Closed Polygon - Calculate area using shoelace formula
-        area = 0.5 * abs(
-            sum(coords[i].x * coords[i + 1].y - coords[i + 1].x * coords[i].y for i in range(len(coords) - 1))
-        )
+        area = 0.5 * abs(sum(ring[i].x * ring[i + 1].y - ring[i + 1].x * ring[i].y for i in range(len(ring) - 1)))
 
         return length, area
 

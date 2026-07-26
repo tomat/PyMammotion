@@ -26,8 +26,6 @@ from pymammotion.transport.base import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
-
     from bleak import BLEDevice
     from bleak.backends.characteristic import BleakGATTCharacteristic
 
@@ -68,7 +66,7 @@ class BLETransportConfig:
     scan_timeout: float = 10.0
     connect_failure_threshold: int = 1
     connect_cooldown_seconds: float = 120.0
-    min_rssi: int = -80
+    min_rssi: int = -90
 
 
 class BLETransport(Transport):
@@ -84,7 +82,8 @@ class BLETransport(Transport):
     reassembled by BleMessage.parseNotification() before being forwarded.
     """
 
-    on_message: Callable[[bytes], Awaitable[None]] | None = None
+    # NOTE: on_message is deliberately NOT redeclared here — a class attribute would
+    # shadow the base Transport.on_message property and defeat its receive-timestamping.
 
     def __init__(self, config: BLETransportConfig) -> None:
         """Initialise the transport with the supplied configuration."""
@@ -114,6 +113,9 @@ class BLETransport(Transport):
         #: Last advertisement RSSI (dBm) pushed via ``set_ble_device``.  ``None``
         #: until a caller supplies one — an unknown RSSI never gates ``is_usable``.
         self._last_rssi: int | None = None
+        #: Strong reference to the in-flight disconnect handler task (see
+        #: ``_dispatch_disconnect``).
+        self._disconnect_task: asyncio.Task[None] | None = None
 
     # ------------------------------------------------------------------
     # Public device management
@@ -155,8 +157,8 @@ class BLETransport(Transport):
         After this call ``is_usable`` returns False until ``set_ble_device()``
         is called with a fresh advertisement.  This is the explicit "give up
         and wait for a new advertisement" entry point — distinct from the
-        automatic ``connect()`` failure-threshold path which preserves the
-        cooldown so retries are paced.
+        automatic ``connect()`` failure-threshold path which arms a cooldown
+        while preserving the device pointer for re-use once the timer lapses.
         """
         self._ble_device = None
         self._consecutive_failures = 0
@@ -188,7 +190,7 @@ class BLETransport(Transport):
             return False
         if self._last_rssi is not None and self._last_rssi < self._config.min_rssi:
             return False
-        return super().is_usable and time.monotonic() >= self._connect_cooldown_until
+        return time.monotonic() >= self._connect_cooldown_until
 
     # ------------------------------------------------------------------
     # Transport ABC
@@ -281,7 +283,7 @@ class BLETransport(Transport):
                     self._handle_disconnect,
                     use_services_cache=True,
                     timeout=2,
-                    max_attempts=2,
+                    max_attempts=1,
                     ble_device_callback=lambda: self._ble_device,  # type: ignore
                 )
             except BleakError as exc:
@@ -308,6 +310,13 @@ class BLETransport(Transport):
                         self._config.device_id,
                     )
                 else:
+                    # Tear the link down: is_connected reads the live client, so leaving
+                    # it connected here would wedge the transport into a state where
+                    # writes succeed but responses never arrive (no notify subscription).
+                    with contextlib.suppress(Exception):
+                        await self._client.disconnect()
+                    self._client = None
+                    self._message = None
                     await self._notify_availability(TransportAvailability.DISCONNECTED)
                     self._record_connect_failure()
                     raise BLEUnavailableError(f"BLE start_notify failed for {self._config.device_id!r}: {exc}") from exc
@@ -356,8 +365,10 @@ class BLETransport(Transport):
         )
         # Reset counter so the next post-cooldown attempt starts a fresh tally.
         self._consecutive_failures = 0
-        # Drop the stale BLEDevice; HA's next advertisement will repopulate.
-        self._ble_device = None
+        # _ble_device is intentionally kept — the device may just be temporarily
+        # out of range and is likely still reachable once the cooldown expires.
+        # is_usable returns False during cooldown via the monotonic timer check,
+        # and automatically recovers to True once the timer lapses.
 
     async def _self_managed_discover(self) -> None:
         """Run a one-shot bleak scan to populate ``_ble_device`` from ``ble_address``.
@@ -402,7 +413,6 @@ class BLETransport(Transport):
                 _logger.warning("BLETransport[%s]: failed to disconnect: %s", self._config.device_id, exc)
         self._client = None
         self._message = None
-        self.clear_ble_device()
         await self._notify_availability(TransportAvailability.DISCONNECTED)
 
     async def _write_payload(self, payload: bytes) -> None:
@@ -426,9 +436,16 @@ class BLETransport(Transport):
             try:
                 await self._message.post_custom_data_bytes(payload)
             except (TimeoutError, BleakError, OSError) as exc:
+                # Clear client refs immediately so is_connected returns False
+                # before _on_disconnect_async runs — prevents the ble_loop from
+                # retrying against a known-dead connection (GATT error 133 etc.).
+                self._client = None
+                self._message = None
                 await self._notify_availability(TransportAvailability.DISCONNECTED)
                 raise TransportError(f"BLE send failed for {self._config.device_id!r}: {exc}") from exc
             if not self._client.is_connected:
+                self._client = None
+                self._message = None
                 await self._notify_availability(TransportAvailability.DISCONNECTED)
                 raise TransportError(
                     f"BLE send failed for {self._config.device_id!r}: client disconnected during write"
@@ -471,7 +488,10 @@ class BLETransport(Transport):
 
     def _dispatch_disconnect(self) -> None:
         """Schedule async disconnect handling.  Runs on the event loop."""
-        asyncio.create_task(self._on_disconnect_async())
+        # Hold a strong reference so the task can't be garbage-collected before it
+        # runs — a dropped disconnect would leave _client set and availability
+        # CONNECTED until the next write fails.
+        self._disconnect_task = asyncio.create_task(self._on_disconnect_async())
 
     async def _on_disconnect_async(self) -> None:
         """Process an unexpected disconnect on the event loop.
@@ -519,10 +539,11 @@ class BLETransport(Transport):
         """Send a one-shot sync packet.
 
         Fired on connect (and as a courtesy on clean disconnect).  Periodic
-        heartbeats are driven by ``DeviceHandle._keep_alive_loop`` (20 s).
+        heartbeats are driven by ``ble_loop.ble_activity_loop``.
         """
         if self._client is None or not self._client.is_connected or self._message is None:
             return
 
         command_bytes = MammotionCommand(self._config.device_id, 0).send_todev_ble_sync(2)
+        _logger.debug("BLETransport: sending one-shot todev_ble_sync(2) (connect/disconnect)")
         await self._message.post_custom_data_bytes(command_bytes)

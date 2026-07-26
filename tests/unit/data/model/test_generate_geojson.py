@@ -1076,3 +1076,115 @@ def test_apply_mow_progress_geojson_unset_rtk_latitude_skipped() -> None:
     )
 
     assert device.map.generated_mow_progress_geojson == {}
+
+
+def _square(size: float = 10.0, *, close: bool = False) -> list[CommDataCouple]:
+    pts = [
+        CommDataCouple(x=0.0, y=0.0),
+        CommDataCouple(x=size, y=0.0),
+        CommDataCouple(x=size, y=size),
+        CommDataCouple(x=0.0, y=size),
+    ]
+    if close:
+        pts.append(CommDataCouple(x=0.0, y=0.0))
+    return pts
+
+
+def test_map_object_stats_open_ring_without_closed_has_no_area() -> None:
+    """Default behaviour unchanged: an open line has a length but no area."""
+    from pymammotion.data.model.generate_geojson import GeojsonGenerator
+
+    length, area = GeojsonGenerator.map_object_stats(_square())
+
+    assert length == pytest.approx(30.0)
+    assert area == 0.0
+
+
+def test_map_object_stats_open_ring_closed_true_computes_area_and_perimeter() -> None:
+    """Polygon-type device frames do not repeat the first point — closed=True
+    must include the implicit closing segment and compute the enclosed area."""
+    from pymammotion.data.model.generate_geojson import GeojsonGenerator
+
+    length, area = GeojsonGenerator.map_object_stats(_square(), closed=True)
+
+    assert length == pytest.approx(40.0)
+    assert area == pytest.approx(100.0)
+
+
+def test_map_object_stats_explicitly_closed_ring_unchanged_by_closed_flag() -> None:
+    """An already closed ring yields identical stats with and without closed=True."""
+    from pymammotion.data.model.generate_geojson import GeojsonGenerator
+
+    length, area = GeojsonGenerator.map_object_stats(_square(close=True))
+    length2, area2 = GeojsonGenerator.map_object_stats(_square(close=True), closed=True)
+
+    assert length == pytest.approx(40.0)
+    assert area == pytest.approx(100.0)
+    assert (length2, area2) == (length, area)
+
+
+def test_map_object_stats_degenerate_closed_segment_has_zero_area() -> None:
+    """Two points declared closed form an out-and-back segment with no area."""
+    from pymammotion.data.model.generate_geojson import GeojsonGenerator
+
+    coords = [CommDataCouple(x=0.0, y=0.0), CommDataCouple(x=5.0, y=0.0)]
+    length, area = GeojsonGenerator.map_object_stats(coords, closed=True)
+
+    assert length == pytest.approx(10.0)
+    assert area == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Empty area name fallback — "Zone N" template
+#
+# When the device reports area names as "" (empty string) the generator must
+# fall back to "Zone 1", "Zone 2" … rather than emitting empty titles.
+# This is the case for the real Luba-LD463652 config entry where both area
+# entries have name="".
+# ---------------------------------------------------------------------------
+
+
+def test_empty_area_name_falls_back_to_zone_template() -> None:
+    """Areas with name='' must be titled "Zone N", not "" or a raw hash string.
+
+    Guards the ``_build_feature_name`` path where ``area_names.get(hash_key)``
+    returns ``""`` (empty string, which is falsy) and the template fallback
+    "Zone {n}" must activate.
+    """
+    fixture = _load_fixture()
+    rtk = LocationPoint(latitude=fixture["rtk"]["latitude"], longitude=fixture["rtk"]["longitude"])
+    dock = Dock(latitude=fixture["dock"]["latitude"], longitude=fixture["dock"]["longitude"], rotation=fixture["dock"]["rotation"])
+
+    # Two distinct hashes — sorted ascending so hash_a → Zone 1, hash_b → Zone 2
+    hash_a = 1_451_834_635_207_421_727
+    hash_b = 1_573_709_403_299_361_829
+    assert hash_a < hash_b  # confirms the expected sort order
+
+    coords = [(0.0, 0.0), (5.0, 0.0), (10.0, 0.0), (10.0, 5.0), (0.0, 5.0)]
+
+    hash_list = HashList()
+    _install_frame(hash_list.area, _make_frame(0, hash_a, coords))
+    _install_frame(hash_list.area, _make_frame(0, hash_b, coords))
+
+    # Both area_name entries have empty string names — mirrors the real device data
+    hash_list.area_name = [
+        AreaHashNameList(name="", hash=hash_a),
+        AreaHashNameList(name="", hash=hash_b),
+    ]
+
+    hash_list.generate_geojson(rtk, dock)
+    result = hash_list.generated_geojson
+
+    area_features = [f for f in result["features"] if f["properties"].get("type_name") == "area"]
+    assert len(area_features) == 2, f"Expected 2 area features, got {len(area_features)}"
+
+    titles = sorted(f["properties"]["title"] for f in area_features)
+    assert titles == ["Area 1", "Area 2"], (
+        f"Expected ['Area 1', 'Area 2'] but got {titles}; "
+        "empty area names must fall back to the Area N template"
+    )
+    # Name and title must match and both be non-empty
+    for feat in area_features:
+        props = feat["properties"]
+        assert props["title"], f"title is empty for area feature with hash {props.get('hash')}"
+        assert props["Name"] == props["title"]

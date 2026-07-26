@@ -6,7 +6,13 @@ Description:
     Connects to mammotion servers to act as a gateway between cloud and a local mqtt server
     publishes all parameters to local mqtt server on change.
 
+    WARNING:
+    There is a bug in dev_console.py or PyMammotion itself that prevents all changes to be published on change.
+    Call "publish_check_all" at regular intervals (30s) to make sure all changed values are published to mqtt
+
     Parameters published under {base_topic}/devices/{device_id}/...../..../.....
+
+
 
     JSON objects are published under:
         {base_topic}/devices/paths_json
@@ -35,8 +41,8 @@ Description:
 
 
         Sagas:
-        {base_topic}/devices/{device_id}/sync_plans                         plans_json / map.plan (Tasks)
-        {base_topic}/devices/{device_id}/sync_mowpath                       mowpath_json / map.current_mow_path (Waypoints)
+        {base_topic}/devices/{device_id}/sync_tasks                         plans_json / map.plan (Tasks)
+        {base_topic}/devices/{device_id}/sync_mow_path                      mowpath_json / map.current_mow_path (Waypoints)
         {base_topic}/devices/{device_id}/sync_map                           areas_json / map.area (Mow areas)
                                                                             paths_json / map.path (Paths channels/tunnels)
 
@@ -86,7 +92,7 @@ Usage:
         EXTERNAL_MQTT_TOPIC=m2m
         EMAIL=your@email.com
         PASSWORD=password_here
-        MAMMOTION2MQTT_HA_VERSION="0.5.45"
+        MAMMOTION2MQTT_HA_VERSION="0.6.0"
         MAMMOTION2MQTT_PUBLISH_STATE=false
 Flags:
     -l / --listen           Connect and receive messages without sending any outbound polls.
@@ -129,6 +135,9 @@ Available in the IPython REPL if running with attached terminal:
     loop                            The main asyncio event loop
     publish_all                     Publish all parameters to MQTT for all devices. Even if the value has not changed.
 """
+
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Imports
 # ──────────────────────────────────────────────────────────────────────────────
@@ -175,8 +184,8 @@ _LOGGER = logging.getLogger(__name__)
 always_update_dump_files = False
 write_log_to_file = False
 publish_full_state = False
-mammotion_client_ha_version = "0.5.44"
-
+mammotion_client_ha_version = "0.6.3"
+mammotion_to_mqtt_version  = "1.1.0"
 
 def _load_env_config() -> None:
     """Load .env file and apply environment-driven config flags (call once at startup)."""
@@ -316,6 +325,11 @@ class ExternalMQTTPublisher:
                 f"{self.base_topic}/mammotion2mqtt/pymammotion_version",
                  payload=version('PyMammotion'),
                  retain=True)
+                 # this to inform about possible changes between versions of mammotion2mqtt
+            await self.client.publish(
+                f"{self.base_topic}/mammotion2mqtt/version",
+                 payload=mammotion_to_mqtt_version,
+                 retain=True)
             await self.client.publish(
                 f"{self.base_topic}/mammotion2mqtt/homeassistant_version",
                  payload=mammotion_client_ha_version,
@@ -435,8 +449,8 @@ class ExternalMQTTPublisher:
         await self.add_mqtt_command("send_and_wait",False,self._execute_send_and_wait)
 
         await self.add_mqtt_command("sync_map",False, self._execute_sync_map)
-        await self.add_mqtt_command("sync_plans",False, self._execute_sync_plans)
-        await self.add_mqtt_command("sync_mowpath",False, self._execute_sync_mowpath)
+        await self.add_mqtt_command("sync_tasks",False, self._execute_sync_tasks)
+        await self.add_mqtt_command("sync_mow_path",False, self._execute_sync_mow_path)
 
         await self.add_mqtt_command("get_stream_subscription",False, self._execute_get_stream_subscription)
         await self.add_mqtt_command("start_stream",False, self._execute_start_stream)
@@ -457,7 +471,8 @@ class ExternalMQTTPublisher:
             await self._execute_send(device_name, "",{"cmd": "allpowerfull_rw","kwargs": {"rw_id": 5,"rw": 1,"context": 2}})
             await self._execute_send(device_name,"", {"cmd": "allpowerfull_rw","kwargs": {"rw_id": 5,"rw": 1,"context": 3}})
         await self.add_mqtt_command("req_errors",False, lambda device_name,payload, data: (_execute_req_errors(device_name,payload,data))) # have to use function here since we need to run 2 async functions
-        await self.add_mqtt_command("req_state_and_location",False, lambda device_name,payload, data: (self._execute_send(device_name,"", {"cmd":"read_write_device","expected_field":"bidire_comm_cmd","kwargs": {"rw_id":5,"rw":1,"context":1,}})))
+        await self.add_mqtt_command("req_state_and_location",False, lambda device_name,payload, data: (self._execute_send(device_name,"",
+            {"cmd":"read_write_device","expected_field":"bidire_comm_cmd","kwargs": {"rw_id":5,"rw":1,"context":1,}})))
 
         await self.add_mqtt_command("send_todev_ble_sync_mqtt",False, lambda device_name,payload, data: (self._execute_send(device_name,"", {"cmd":"send_todev_ble_sync","kwargs": {"sync_type": 3}})))
         await self.add_mqtt_command("send_todev_ble_sync_ble",False, lambda device_name,payload, data: (self._execute_send(device_name,"", {"cmd":"send_todev_ble_sync","kwargs": {"sync_type": 1}})))
@@ -691,7 +706,7 @@ class ExternalMQTTPublisher:
             }
 
             # Use command-specific topic, fall back to generic "send" topic
-            topic_suffix = command if command in ["send_and_wait","send"] else "mammotion_to_mqtt"
+            topic_suffix = command if command in ["send_and_wait","send"] else "mammotion2mqtt"
             topic = f"{self.base_topic}/devices/{device_name}/{topic_suffix}/response_json"
 
             await self.publish(topic, response, retain=False)
@@ -1149,7 +1164,7 @@ class ExternalMQTTPublisher:
                 cmd=cmd, expected_field=expected_field, error=str(e)
             )
             _LOGGER.error("✗ send_and_wait failed: %s", e)
-    async def _execute_sync_mowpath(self, device_name: str,payload:str, cmd_data: dict) -> None:
+    async def _execute_sync_mowpath_old(self, device_name: str,payload:str, cmd_data: dict) -> None:
         """Execute sync_mowpath command."""
         if not self.dev_console:
             return
@@ -1171,6 +1186,30 @@ class ExternalMQTTPublisher:
         except Exception as e:
             await self._publish_command_response(device_name, "sync_mowpath", "error", error=str(e))
             _LOGGER.error("✗ sync_mowpath failed: %s", e)
+    async def _execute_sync_mow_path(self, device_name: str,payload:str, cmd_data: dict) -> None:
+        """Execute sync_mow_path command."""
+        if not self.dev_console:
+            return
+
+        timeout = cmd_data.get("timeout", 120.0)
+
+        await self._publish_command_response(device_name, "sync_mow_path", "sending", timeout=timeout)
+
+        try:
+            #self.dev_console.mammotion.set_mow_path_fetch_enabled(device_id,enabled=True)
+            handle = self.dev_console.mammotion.device_registry.get_by_name(device_name)
+            if handle:
+                #if handle.mow_path_fetch_enabled == False:
+                handle.set_mow_path_fetch_enabled(value=True)
+
+            #await self.dev_console.mammotion.check_and_get_mow_path(device_name)
+            await self.dev_console.mammotion.start_mow_path_saga(device_name,zone_hashs = [],skip_planning = False)
+
+            await self._publish_command_response(device_name, "sync_mow_path", "enqueued", timeout=timeout)
+            _LOGGER.info("✓ sync_mow_path enqueued: %s", device_name)
+        except Exception as e:
+            await self._publish_command_response(device_name, "sync_mow_path", "error", error=str(e))
+            _LOGGER.error("✗ sync_mow_path failed: %s", e)
     async def _execute_sync_map(self, device_name: str,payload:str, cmd_data: dict) -> None:
         """Execute sync_map command."""
         if not self.dev_console:
@@ -1188,22 +1227,23 @@ class ExternalMQTTPublisher:
         except Exception as e:
             await self._publish_command_response(device_name, "sync_map", "error", error=str(e))
             _LOGGER.error("✗ sync_map failed: %s", e)
-    async def _execute_sync_plans(self, device_name: str,payload:str, cmd_data: dict) -> None:
-        """Execute sync_plans command."""
+    async def _execute_sync_tasks(self, device_name: str,payload:str, cmd_data: dict) -> None:
+        """Execute sync_tasks command."""
         if not self.dev_console:
             return
 
         timeout = cmd_data.get("timeout", 120.0)
 
-        await self._publish_command_response(device_name, "sync_plans", "sending", timeout=timeout)
+        await self._publish_command_response(device_name, "sync_tasks", "sending", timeout=timeout)
 
         try:
             await self.dev_console.mammotion.start_plan_sync(device_name)
-            await self._publish_command_response(device_name, "sync_plans", "enqueued", timeout=timeout)
-            _LOGGER.info("✓ sync_plans enqueued: %s", device_name)
+            await self._publish_command_response(device_name, "sync_tasks", "enqueued", timeout=timeout)
+            _LOGGER.info("✓ sync_tasks enqueued: %s", device_name)
         except Exception as e:
-            await self._publish_command_response(device_name, "sync_plans", "error", error=str(e))
-            _LOGGER.error("✗ sync_plans failed: %s", e)
+            await self._publish_command_response(device_name, "sync_tasks", "error", error=str(e))
+            _LOGGER.error("✗ sync_tasks failed: %s", e)
+
 
 
 
@@ -1344,6 +1384,8 @@ async def _main(args: argparse.Namespace) -> None:
         "send": dev.send,
         "send_and_wait": dev.send_and_wait,
         "sync_map": dev.sync_map,
+        "sync_mow_path": dev.sync_mow_path,
+        "sync_tasks": dev.sync_tasks,
         "fetch_rtk": dev.fetch_rtk,
         "dump": dev.dump,
         "dump_all": dev.dump_all,
@@ -1371,6 +1413,8 @@ async def _main(args: argparse.Namespace) -> None:
         "  [cyan]send(name, cmd, **kwargs)[/cyan]                           — queue a command (blocking)\n"
         "  [cyan]send_and_wait(name, cmd, expected_field, **kwargs)[/cyan]  — send and block for response\n"
         "  [cyan]sync_map(name)[/cyan]                                      — run a full MapFetchSaga (blocking)\n"
+        "  [cyan]sync_mow_path(name, zone_hashs=None, skip_planning=True)[/cyan]  — fetch mow cover path\n"
+        "  [cyan]sync_tasks(name)[/cyan]                                    — fetch all scheduled task plans\n"
         "  [cyan]fetch_rtk(name)[/cyan]                                     — fetch LoRa version for an RTK base station\n"
         "  [cyan]dump(name)[/cyan]                                          — write state_{name}.json\n"
         "  [cyan]dump_all()[/cyan]                                          — write state JSON for all devices\n"
@@ -1403,7 +1447,7 @@ async def _main(args: argparse.Namespace) -> None:
         # Run IPython in a thread so the main loop stays alive for MQTT
         await asyncio.to_thread(_start_repl)
     else:
-        print("Running without terminal attached, like in docker, printing DateTime every minute")
+        print("Running without terminal attached, Running in docker?, printing DateTime every minute")
         await asyncio.to_thread(_run_idle_loop)
 
     _LOGGER.info("REPL exited — shutting down.")
