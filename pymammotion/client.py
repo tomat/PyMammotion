@@ -2584,21 +2584,28 @@ class MammotionClient:
         transport.set_ble_device(ble_device)
         await handle.add_transport(transport)
 
-    async def _fetch_stream_subscription(self, http: MammotionHTTP, iot_id: str, is_yuka: bool) -> Any:
+    async def _fetch_stream_subscription(
+        self,
+        http: MammotionHTTP,
+        iot_id: str,
+        is_yuka: bool,
+        *,
+        legacy: bool = False,
+    ) -> Any:
         """Fetch the stream subscription token, retrying once if the response carries no data.
 
         The Mammotion stream-token endpoint intermittently returns an empty ``data``
         payload; a single immediate retry usually succeeds.  The empty response is
         logged at error level so the failure is visible even when the retry recovers.
         """
-        subscription = await http.get_stream_subscription(iot_id, is_yuka)
+        subscription = await http.get_stream_subscription(iot_id, is_yuka, legacy=legacy)
         if subscription is None or subscription.data is None:
             _logger.error(
                 "get_stream_subscription for %s returned no data (response=%s) — retrying once",
                 iot_id,
                 subscription,
             )
-            subscription = await http.get_stream_subscription(iot_id, is_yuka)
+            subscription = await http.get_stream_subscription(iot_id, is_yuka, legacy=legacy)
         return subscription
 
     async def get_stream_subscription(self, device_name: str, iot_id: str) -> Any:
@@ -2614,16 +2621,16 @@ class MammotionClient:
         if http is None:
             return None
         is_yuka = DeviceType.is_yuka(device_name)
+        handle = self._device_registry.get_by_name(device_name)
+        try:
+            new_fpv = handle is not None and handle.snapshot.raw.report_data.dev.fpv_info is not None  # type: ignore
+        except AttributeError:
+            new_fpv = False
         await self.send_command_with_args(device_name, "device_agora_join_channel_with_position", enter_state=0)
-        subscription = await self._fetch_stream_subscription(http, iot_id, is_yuka)
+        subscription = await self._fetch_stream_subscription(http, iot_id, is_yuka, legacy=not new_fpv)
 
-        if handle := self._device_registry.get_by_name(device_name):
-            try:
-                new_fpv = handle.snapshot.raw.report_data.dev.fpv_info is not None  # type: ignore
-            except AttributeError:
-                new_fpv = False
-            if not new_fpv:
-                await self.send_command_with_args(device_name, "device_agora_join_channel_with_position", enter_state=1)
+        if handle is not None and not new_fpv:
+            await self.send_command_with_args(device_name, "device_agora_join_channel_with_position", enter_state=1)
 
         return subscription
 
@@ -2639,16 +2646,16 @@ class MammotionClient:
         if http is None:
             return None
         is_yuka = DeviceType.is_yuka(device_name)
+        handle = self._device_registry.get_by_name(device_name)
+        try:
+            new_fpv = handle is not None and handle.snapshot.raw.report_data.dev.fpv_info is not None  # type: ignore
+        except AttributeError:
+            new_fpv = False
 
-        subscription = await self._fetch_stream_subscription(http, iot_id, is_yuka)
+        subscription = await self._fetch_stream_subscription(http, iot_id, is_yuka, legacy=not new_fpv)
 
-        if handle := self._device_registry.get_by_name(device_name):
-            try:
-                new_fpv = handle.snapshot.raw.report_data.dev.fpv_info is not None  # type: ignore
-            except AttributeError:
-                new_fpv = False
-            if not new_fpv:
-                await self.send_command_with_args(device_name, "device_agora_join_channel_with_position", enter_state=1)
+        if handle is not None and not new_fpv:
+            await self.send_command_with_args(device_name, "device_agora_join_channel_with_position", enter_state=1)
 
         return subscription
 

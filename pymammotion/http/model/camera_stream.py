@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from mashumaro.mixins.orjson import DataClassORJSONMixin
 
@@ -7,21 +7,26 @@ from mashumaro.mixins.orjson import DataClassORJSONMixin
 class Camera(DataClassORJSONMixin):
     """Single camera entry within a stream subscription response."""
 
-    cameraId: int
-    token: str
+    cameraId: int = 0
+    token: str = ""
 
 
 @dataclass
 class StreamSubscriptionResponse(DataClassORJSONMixin):
-    """Agora stream subscription token and channel details returned by the cloud API."""
+    """Agora stream details returned by either Mammotion FPV API generation.
 
-    appid: str
-    openEncrypt: int
-    cameras: list[Camera]
-    channelName: str
-    areaCode: str
-    token: str
-    uid: int
+    The legacy ``/stream/subscription`` response omits the encryption, region,
+    licence, and remaining-time fields added by ``/stream/token``.  Defaults
+    keep both response shapes compatible with the same HA-facing model.
+    """
+
+    appid: str = ""
+    openEncrypt: int = 0
+    cameras: list[Camera] = field(default_factory=list)
+    channelName: str = ""
+    areaCode: str = ""
+    token: str = ""
+    uid: int = 0
     license: str | None = None
     availableTime: int | None = None
 

@@ -10,6 +10,7 @@ import hmac
 import json
 import logging
 import random
+import secrets
 import time
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
@@ -444,55 +445,113 @@ class MammotionHTTP:
 
         return Response(code=200, msg="success")
 
-    @refresh_token_decorator
-    async def get_stream_subscription(self, iot_id: str, is_yuka: bool) -> Response[StreamSubscriptionResponse]:
-        # Prepare the payload with cameraStates based on is_yuka flag
-        """Fetches stream subscription data for a given IoT device."""
-
-        payload = {"deviceId": iot_id, "mode": 0, "cameraStates": []}
-
-        # Add appropriate cameraStates based on the is_yuka flag
-        # yukas have two cameras you could view [{"cameraState": 1}, {"cameraState": 0}, {"cameraState": 1}]
-        # but its not useful so ignore this and only subscribe to the front one.
-        if is_yuka:
-            payload["cameraStates"] = [{"cameraState": 1}, {"cameraState": 0}, {"cameraState": 0}]
+    async def _request_stream_subscription(
+        self,
+        iot_id: str,
+        is_yuka: bool,
+        *,
+        legacy: bool,
+        retry_auth: bool,
+    ) -> Response[StreamSubscriptionResponse]:
+        """Issue one FPV subscription request and optionally recover stale auth."""
+        endpoint = "subscription" if legacy else "token"
+        if legacy:
+            payload: dict[str, Any] = {"deviceId": iot_id}
         else:
-            payload["cameraStates"] = [{"cameraState": 1}, {"cameraState": 0}, {"cameraState": 0}]
+            camera_states = [1, 0, 1] if is_yuka else [1, 0, 0]
+            payload = {
+                "deviceId": iot_id,
+                "mode": 0,
+                "cameraStates": [{"cameraState": state} for state in camera_states],
+            }
 
         async with self._client_session() as session:
             resp = await session.post(
-                f"{MAMMOTION_API_DOMAIN}/device-server/v1/stream/token",
+                f"{MAMMOTION_API_DOMAIN}/device-server/v1/stream/{endpoint}",
                 json=payload,
                 headers={
                     **self._headers,
                     "Authorization": f"Bearer {self._require_login_info.access_token}",
                     "Content-Type": "application/json",
+                    "Accept-Language": "en-US",
+                    "Client-Id": self.client_id,
+                    "Client-Type": "1",
+                    "Request-Id": "".join(str(secrets.randbelow(10)) for _ in range(21)),
+                    "L-T-Z": f"{int(time.time())}/0/0",
                 },
             )
             content_type = resp.headers.get("Content-Type") or ""
             body = await resp.text()
-            _LOGGER.debug(
-                "stream/token response: status=%s content-type=%s body=%.500s",
-                resp.status,
-                content_type,
-                body,
-            )
-            if content_type.startswith("application/json"):
-                response = response_factory(Response[StreamSubscriptionResponse], json.loads(body))
-                if response.data is None:
-                    _LOGGER.warning(
-                        "stream/token returned JSON with no stream data (code=%s msg=%s)",
-                        response.code,
-                        response.msg,
-                    )
-                return response
 
+        _LOGGER.debug(
+            "stream/%s response: status=%s content-type=%s body=%.500s",
+            endpoint,
+            resp.status,
+            content_type,
+            body,
+        )
+        try:
+            raw_response = json.loads(body)
+        except (TypeError, json.JSONDecodeError):
             _LOGGER.warning(
-                "stream/token returned non-JSON response (status=%s content-type=%s)",
+                "stream/%s returned non-JSON response (status=%s content-type=%s)",
+                endpoint,
                 resp.status,
                 content_type,
             )
             return Response(code=resp.status, msg="non-json response")
+
+        response = response_factory(Response[StreamSubscriptionResponse], raw_response)
+        if (resp.status == 401 or response.code in (401, 40105)) and retry_auth:
+            _LOGGER.info("stream/%s rejected stale authentication; refreshing and retrying once", endpoint)
+            refresh_response = await self.refresh_login()
+            if refresh_response.code == 0:
+                return await self._request_stream_subscription(
+                    iot_id,
+                    is_yuka,
+                    legacy=legacy,
+                    retry_auth=False,
+                )
+
+        if response.data is None:
+            _LOGGER.warning(
+                "stream/%s returned JSON with no stream data (code=%s msg=%s)",
+                endpoint,
+                response.code,
+                response.msg,
+            )
+        return response
+
+    @refresh_token_decorator
+    async def get_stream_subscription(
+        self,
+        iot_id: str,
+        is_yuka: bool,
+        *,
+        legacy: bool = False,
+    ) -> Response[StreamSubscriptionResponse]:
+        """Fetch Agora data using the FPV API generation reported by the mower.
+
+        Old firmware uses ``/stream/subscription``.  New firmware uses
+        ``/stream/token`` with camera-state selection.  If a mower rejects the
+        new endpoint as unsupported, retry the legacy endpoint once so a lost
+        telemetry flag cannot permanently disable video.
+        """
+        response = await self._request_stream_subscription(
+            iot_id,
+            is_yuka,
+            legacy=legacy,
+            retry_auth=True,
+        )
+        if not legacy and response.code == 40200:
+            _LOGGER.info("Mower %s rejected the new FPV API; falling back to the legacy endpoint", iot_id)
+            return await self._request_stream_subscription(
+                iot_id,
+                is_yuka,
+                legacy=True,
+                retry_auth=True,
+            )
+        return response
 
     @refresh_token_decorator
     async def get_video_resource(self, iot_id: str) -> Response[VideoResourceResponse]:
