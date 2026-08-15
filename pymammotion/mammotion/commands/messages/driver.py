@@ -119,7 +119,11 @@ class MessageDriver(AbstractMessage, ABC):
         logger.debug(f"Control command print, linearSpeed={linear_speed} // angularSpeed={angular_speed}")
         return self.send_order_msg_driver(
             MctlDriver(
-                todev_devmotion_ctrl=DrvMotionCtrl(set_linear_speed=linear_speed, set_angular_speed=angular_speed)
+                todev_devmotion_ctrl=DrvMotionCtrl(
+                    set_linear_speed=linear_speed,
+                    set_angular_speed=angular_speed,
+                    channel=1,
+                )
             )
         )
 

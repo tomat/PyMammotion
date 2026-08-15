@@ -65,6 +65,7 @@ __all__ = (
     "DrvKnifeStatus",
     "DrvListUpload",
     "DrvMotionCtrl",
+    "DrvMotionCtrlAck",
     "DrvMowCtrlByHand",
     "DrvSrSpeed",
     "DrvUpgradeReport",
@@ -1738,8 +1739,22 @@ class DrvMotionCtrl(betterproto2.Message):
 
     set_angular_speed: "int" = betterproto2.field(2, betterproto2.TYPE_INT32)
 
+    channel: "int" = betterproto2.field(3, betterproto2.TYPE_INT32)
+
 
 default_message_pool.register_message("", "DrvMotionCtrl", DrvMotionCtrl)
+
+
+@dataclass(eq=False, repr=False)
+class DrvMotionCtrlAck(betterproto2.Message):
+    timestamp: "int" = betterproto2.field(1, betterproto2.TYPE_UINT64)
+
+    is_drop: "int" = betterproto2.field(2, betterproto2.TYPE_INT32)
+
+    delay_ms: "int" = betterproto2.field(3, betterproto2.TYPE_UINT64)
+
+
+default_message_pool.register_message("", "DrvMotionCtrlAck", DrvMotionCtrlAck)
 
 
 @dataclass(eq=False, repr=False)
@@ -2386,6 +2401,10 @@ class MctlDriver(betterproto2.Message):
 
     current_cutter_mode: "AppGetCutterWorkMode | None" = betterproto2.field(
         14, betterproto2.TYPE_MESSAGE, optional=True, group="SubDrvMsg"
+    )
+
+    toapp_devmotion_ctrl_ack: "DrvMotionCtrlAck | None" = betterproto2.field(
+        16, betterproto2.TYPE_MESSAGE, optional=True, group="SubDrvMsg"
     )
 
 
