@@ -37,3 +37,15 @@ def test_motion_ack_is_decoded() -> None:
         is_drop=1,
         delay_ms=456,
     )
+
+
+def test_factory_motion_command_uses_driver_field_15() -> None:
+    """Factory movement packets use the app descriptor's field 15."""
+    command = MammotionCommand(device_name="YUKA", user_account=123)
+
+    message = LubaMsg.FromString(
+        command.send_test_movement(linear_speed=250, angular_speed=0)
+    )
+
+    assert message.driver is not None
+    assert message.driver._unknown_fields == bytes.fromhex("7a0508fa011801")
