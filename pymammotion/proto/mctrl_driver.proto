@@ -23,6 +23,13 @@ enum UnloadMotorState {
 message DrvMotionCtrl {
   int32 setLinearSpeed = 1;
   int32 setAngularSpeed = 2;
+  int32 channel = 3;
+}
+
+message DrvMotionCtrlAck {
+  uint64 timestamp = 1;
+  int32 isDrop = 2;
+  uint64 delayMs = 3;
 }
 
 message DrvKnifeHeight {
@@ -103,5 +110,6 @@ message MctlDriver {
     DrvCollectCtrlByHand collect_ctrl_by_hand = 12;
     AppSetCutterWorkMode cutter_mode_ctrl_by_hand = 13;
     AppGetCutterWorkMode current_cutter_mode = 14;
+    DrvMotionCtrlAck toapp_devmotion_ctrl_ack = 16;
   }
 }

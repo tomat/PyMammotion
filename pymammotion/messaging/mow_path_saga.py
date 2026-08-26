@@ -88,6 +88,20 @@ class MowPathSaga(Saga):
         self._route_val: GenerateRouteInformation | None = (
             route_info  # persists across retries to skip step 2 if already fetched
         )
+        #: One-shot: step-1 completion may reset the retry budget at most once per saga.
+        self._budget_reset_granted = False
+
+    async def _send_ble_sync(self) -> None:
+        """Keep the device in its synced/responsive state before a major fetch request.
+
+        The device only serves hash-list / route / cover-path frames while it considers the
+        app "synced", and that state lapses after a few seconds.  We re-sync immediately
+        before each major request (line hash list, route info, cover-path fetch) so the
+        device is freshly synced when the command arrives, rather than relying on a single
+        sync at the top of the run that goes stale across the intervening frame loops.
+        """
+        _logger.debug("MowPathSaga[%s]: sending todev_ble_sync(%d)", self._device_name, self._sync_type)
+        await self._send_command(self._command_builder.send_todev_ble_sync(sync_type=self._sync_type))
 
     async def _run(self, broker: DeviceMessageBroker) -> None:
         """Execute all saga steps."""
@@ -97,9 +111,8 @@ class MowPathSaga(Saga):
         # defeats the per-hash skip logic below and forces a full re-fetch on
         # every retry, mirroring what the APK's HashDataManager avoids.
 
-        # start with ble sync
-        cmd = self._command_builder.send_todev_ble_sync(sync_type=self._sync_type)
-        await self._send_command(cmd)
+        # start with ble sync (immediately precedes the step-1 line-hash-list request below)
+        await self._send_ble_sync()
 
         # ------------------------------------------------------------------
         # Step 1: Request the line hash list (sub_cmd=3), collect all frames,
@@ -146,8 +159,14 @@ class MowPathSaga(Saga):
                 await self._send_command(ack_cmd)
 
                 if ack.current_frame == ack.total_frame:
-                    # Step 1 fully complete — earned a fresh attempt budget for the rest of the saga.
-                    self._reset_attempt_counter = True
+                    # Step 1 fully complete — earned a fresh attempt budget for the
+                    # rest of the saga, but only ONCE per saga: every run reaches this
+                    # point, and re-earning the budget on each retry made max_attempts
+                    # meaningless (a device that never streams cover paths would loop
+                    # send/timeout/restart for the full total_timeout).
+                    if not self._budget_reset_granted:
+                        self._budget_reset_granted = True
+                        self._reset_attempt_counter = True
                     break
 
         # ------------------------------------------------------------------
@@ -158,6 +177,9 @@ class MowPathSaga(Saga):
                 # planning mode: send generate_route_information, wait for sub_cmd=0 confirmation
                 route_info = self._route_info or GenerateRouteInformation(one_hashs=self._zone_hashs)
                 _logger.debug("MowPathSaga: sending generate_route_information for %d zone(s)", len(self._zone_hashs))
+                # Re-sync before the route request — the step-1 frame loop above can stale
+                # the run's initial sync.
+                await self._send_ble_sync()
                 cmd = self._command_builder.generate_route_information(route_info)
                 response = await broker.send_and_wait(
                     send_fn=lambda: self._send_command(cmd),
@@ -230,6 +252,8 @@ class MowPathSaga(Saga):
             return sum(len(v) for v in self._get_map().find_missing_mow_path_frames().values())
 
         with self._collect_frames(broker, "cover_path_upload") as path_queue:
+            # Re-sync before the cover-path fetch begins — same reasoning as the route step.
+            await self._send_ble_sync()
             for batch_idx, batch_hashes in enumerate(hash_batches):
                 transaction_id = int(time.time() * 1000)
                 current_run_tx_ids.add(transaction_id)

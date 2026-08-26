@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import hmac
 import itertools
@@ -185,10 +186,10 @@ class CloudIOTGateway:
 
     async def get_region(self, country_code: str) -> RegionResponse:
         """Get the region based on country code and auth code."""
-        auth_code = self.mammotion_http.login_info.authorization_code  # type: ignore
-
         if self._region_response is not None:
             return self._region_response
+
+        auth_code = self.mammotion_http.login_info.authorization_code  # type: ignore
 
         config = Config(app_key=self._app_key, app_secret=self._app_secret, domain=self.domain, protocol="https")
         client = Client(config)
@@ -227,7 +228,11 @@ class CloudIOTGateway:
             body["data"]["pushChannelEndpoint"] = f"living-accs.{region}.aliyuncs.com"
             body["data"]["apiGatewayEndpoint"] = f"{region}.api-iot.aliyuncs.com"
 
-            return RegionResponse.from_dict(body)
+            # Callers read region_response after this returns — the fallback must be
+            # stored too, or the very next step (aep_handle) crashes on None and a
+            # transient network timeout is escalated to a destructive re-login.
+            self._region_response = RegionResponse.from_dict(body)
+            return self._region_response
         # Decode the response body
         response_body_str = response.body.decode("utf-8")
         # Load the JSON string into a dictionary
@@ -239,7 +244,7 @@ class CloudIOTGateway:
         self._region_response = RegionResponse.from_dict(response_body_dict)
         logger.debug("Endpoint: %s", self._region_response.data.mqttEndpoint)
 
-        return response.body
+        return self._region_response
 
     async def aep_handle(self) -> AepResponse:
         """Handle AEP authentication."""
@@ -300,7 +305,6 @@ class CloudIOTGateway:
     async def connect(self) -> ConnectResponse:
         """Connect to the Aliyun Cloud IoT Gateway."""
         region_url = "sdk.openaccount.aliyun.com"
-        time_now = time.time()
         async with ClientSession() as session:
             headers = {
                 "host": region_url,
@@ -372,23 +376,11 @@ class CloudIOTGateway:
                 raise LoginException(data)
 
     async def login_by_oauth(self, country_code: str):
-        """Login by OAuth."""
+        """Login by OAuth, retrying transient Aliyun gateway failures."""
         auth_code = self.mammotion_http.login_info.authorization_code  # type: ignore
         region_url = self._region_response.data.oaApiGatewayEndpoint  # type: ignore
 
         async with ClientSession() as session:
-            headers = {
-                "host": region_url,
-                "date": UtilClient.get_date_utcstring(),
-                "x-ca-nonce": UtilClient.get_nonce(),
-                "x-ca-key": self._app_key,
-                "x-ca-signaturemethod": "HmacSHA256",
-                "accept": "application/json",
-                "content-type": "application/x-www-form-urlencoded; charset=utf-8",
-                "user-agent": UtilClient.get_user_agent(""),
-                "vid": self._connect_response.data.vid,  # type: ignore
-            }
-
             _bodyParam = {
                 "country": country_code,
                 "authCode": auth_code,
@@ -407,42 +399,78 @@ class CloudIOTGateway:
                 },
             }
 
-            # Get sign header
-            dic = headers.copy()
-            for key in MOVE_HEADERS:
-                dic.pop(key, None)
+            encoded_request = json.dumps(_bodyParam, separators=(",", ":"))
+            last_error: dict[str, Any] = {}
+            for attempt in range(3):
+                headers = {
+                    "host": region_url,
+                    "date": UtilClient.get_date_utcstring(),
+                    "x-ca-nonce": UtilClient.get_nonce(),
+                    "x-ca-key": self._app_key,
+                    "x-ca-signaturemethod": "HmacSHA256",
+                    "accept": "application/json",
+                    "content-type": "application/x-www-form-urlencoded; charset=utf-8",
+                    "user-agent": UtilClient.get_user_agent(""),
+                    "vid": self._connect_response.data.vid,  # type: ignore
+                }
 
-            keys = sorted(dic.keys())
-            sign_headers = ",".join(keys)
-            header = "".join(f"{k}:{dic[k]}\n" for k in keys).strip()
+                dic = headers.copy()
+                for key in MOVE_HEADERS:
+                    dic.pop(key, None)
 
-            headers["x-ca-signature-headers"] = sign_headers
-            string_to_sign = "POST\n{}\n\n{}\n{}\n{}\n/api/prd/loginbyoauth.json?{}".format(
-                headers["accept"],
-                headers["content-type"],
-                headers["date"],
-                header,
-                f"loginByOauthRequest={json.dumps(_bodyParam, separators=(',', ':'))}",
-            )
+                keys = sorted(dic.keys())
+                sign_headers = ",".join(keys)
+                header = "".join(f"{k}:{dic[k]}\n" for k in keys).strip()
 
-            hash_val = hmac.new(
-                self._app_secret.encode("utf-8"),
-                string_to_sign.encode("utf-8"),
-                hashlib.sha256,
-            ).digest()
-            signature = base64.b64encode(hash_val).decode("utf-8")
-            headers["x-ca-signature"] = signature
-            async with session.post(
-                f"https://{region_url}/api/prd/loginbyoauth.json",
-                headers=headers,
-                data={"loginByOauthRequest": json.dumps(_bodyParam, separators=(",", ":"))},
-            ) as resp:
-                data = await resp.json()
-                logger.debug(data)
+                headers["x-ca-signature-headers"] = sign_headers
+                string_to_sign = "POST\n{}\n\n{}\n{}\n{}\n/api/prd/loginbyoauth.json?{}".format(
+                    headers["accept"],
+                    headers["content-type"],
+                    headers["date"],
+                    header,
+                    f"loginByOauthRequest={encoded_request}",
+                )
+
+                hash_val = hmac.new(
+                    self._app_secret.encode("utf-8"),
+                    string_to_sign.encode("utf-8"),
+                    hashlib.sha256,
+                ).digest()
+                headers["x-ca-signature"] = base64.b64encode(hash_val).decode("utf-8")
+
+                async with session.post(
+                    f"https://{region_url}/api/prd/loginbyoauth.json",
+                    headers=headers,
+                    data={"loginByOauthRequest": encoded_request},
+                ) as resp:
+                    content_type = resp.headers.get("Content-Type") or ""
+                    body = await resp.text()
+
+                try:
+                    data = json.loads(body)
+                except (TypeError, JSONDecodeError):
+                    data = {
+                        "code": resp.status,
+                        "message": "Aliyun login returned a non-JSON response",
+                    }
+                logger.debug(
+                    "login_by_oauth response status=%s content-type=%s data=%s", resp.status, content_type, data
+                )
                 if resp.status == 200:
                     self._login_by_oauth_response = LoginByOAuthResponse.from_dict(data)
                     return self._login_by_oauth_response
-                raise LoginException(data)
+
+                last_error = data
+                if resp.status not in (500, 502, 503, 504) or attempt == 2:
+                    break
+                logger.warning(
+                    "Aliyun login_by_oauth returned transient HTTP %s; retrying (%s/3)",
+                    resp.status,
+                    attempt + 2,
+                )
+                await asyncio.sleep(1 << attempt)
+
+            raise LoginException(last_error)
 
     async def session_by_auth_code(self) -> SessionByAuthCodeResponse:
         """Create a session by auth code."""
@@ -545,8 +573,7 @@ class CloudIOTGateway:
         response_body_str = response.body.decode("utf-8")
 
         # Load the JSON string into a dictionary
-        response_body_dict = self.parse_json_response(response_body_str)
-        return response_body_dict
+        return self.parse_json_response(response_body_str)
 
     async def check_or_refresh_session(self, *, force: bool = False) -> None:
         """Check or refresh the Aliyun IoT session token.
@@ -586,7 +613,7 @@ class CloudIOTGateway:
             ):
                 return
 
-            logger.debug("Trying to refresh token")
+            logger.debug("Trying to refresh token %s", force)
             config = Config(
                 app_key=self._app_key,
                 app_secret=self._app_secret,
@@ -626,7 +653,10 @@ class CloudIOTGateway:
             response_body_dict = self.parse_json_response(response_body_str)
 
             if response_body_dict.get("code") == 2401:
-                await self.sign_out()
+                # Best-effort: a network failure inside sign_out must not mask the
+                # 2401 — TokenManager keys its recovery path off SessionExpiredError.
+                with contextlib.suppress(Exception):
+                    await self.sign_out()
                 raise SessionExpiredError(
                     TransportType.CLOUD_ALIYUN, "Error check or refresh token: " + response_body_dict.__str__()
                 )

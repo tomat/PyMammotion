@@ -5,6 +5,7 @@ These lock in the fix for the silent 401 on the first cloud call after a restore
 ``iotToken`` as freshly issued, skipped ``check_or_refresh_session``'s refresh, and
 the first cloud call (e.g. ``list_binding_by_account``) returned 401/460.
 """
+
 from __future__ import annotations
 
 import time
@@ -14,7 +15,12 @@ import orjson
 import pytest
 
 from pymammotion.aliyun.cloud_gateway import CloudIOTGateway
-from pymammotion.aliyun.exceptions import DeviceOfflineException, DeviceUnboundException, TooManyRequestsException
+from pymammotion.aliyun.exceptions import (
+    DeviceOfflineException,
+    DeviceUnboundException,
+    LoginException,
+    TooManyRequestsException,
+)
 from pymammotion.aliyun.model.regions_response import RegionResponse, RegionResponseData
 from pymammotion.aliyun.model.session_by_authcode_response import (
     SessionByAuthCodeResponse,
@@ -50,6 +56,56 @@ def _region() -> RegionResponse:
             apiGatewayEndpoint="api.example.com",
         ),
     )
+
+
+class _OAuthResponse:
+    status = 504
+    headers = {"Content-Type": "application/oct-stream"}
+
+    async def __aenter__(self) -> _OAuthResponse:
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+    async def text(self) -> str:
+        return "gateway timeout"
+
+
+class _OAuthSession:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    async def __aenter__(self) -> _OAuthSession:
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+    def post(self, url: str, **kwargs: object) -> _OAuthResponse:
+        self.calls.append((url, kwargs))
+        return _OAuthResponse()
+
+
+async def test_login_by_oauth_retries_non_json_gateway_timeouts() -> None:
+    """A transient 504 must not fail while decoding its octet-stream body."""
+    http = MagicMock()
+    http.login_info.authorization_code = "auth-code"
+    gateway = CloudIOTGateway(mammotion_http=http, region_response=_region())
+    gateway._connect_response = MagicMock()  # noqa: SLF001
+    gateway._connect_response.data.data.device.data.deviceId = "device-id"  # noqa: SLF001
+    gateway._connect_response.data.vid = "vid"  # noqa: SLF001
+    session = _OAuthSession()
+
+    with (
+        patch("pymammotion.aliyun.cloud_gateway.ClientSession", return_value=session),
+        patch("pymammotion.aliyun.cloud_gateway.asyncio.sleep", new=AsyncMock()) as sleep,
+        pytest.raises(LoginException),
+    ):
+        await gateway.login_by_oauth("SE")
+
+    assert len(session.calls) == 3
+    assert sleep.await_count == 2
 
 
 def test_to_cache_stamps_token_issued_at() -> None:
@@ -345,8 +401,7 @@ async def test_backoff_doubles_on_successive_429s() -> None:
                     await gw.send_cloud_command(_DUMMY_IOT_ID, _DUMMY_COMMAND)
 
             assert gw._rate_limited_until == pytest.approx(current_now + expected_backoff), (
-                f"Expected backoff {expected_backoff} s, "
-                f"got {gw._rate_limited_until - current_now} s"
+                f"Expected backoff {expected_backoff} s, got {gw._rate_limited_until - current_now} s"
             )
 
 

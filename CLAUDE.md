@@ -19,7 +19,7 @@ uv sync
 uv run ruff check --fix pymammotion/
 uv run ruff format pymammotion/
 
-# Type checking (excludes proto/, tests/, scripts/, linkkit/ — configured in pyproject.toml [tool.ty])
+# Type checking (excludes proto/, tests/, scripts/ — configured in pyproject.toml [tool.ty])
 uv run ty check pymammotion/
 
 # Additional linting
@@ -75,7 +75,8 @@ The refactored architecture is a **layered, composable system** replacing the ea
 │  Restartable multi-step operations:                      │
 │  ├─ Saga  (saga.py)  — base class with retry logic       │
 │  ├─ MapFetchSaga  (map_saga.py)                          │
-│  └─ MowPathSaga  (mow_path_saga.py)                      │
+│  ├─ MowPathSaga  (mow_path_saga.py)                      │
+│  └─ Plan/Spino/Svg/EdgeMapping sagas (messaging/)        │
 ├──────────────────────────────────────────────────────────┤
 │  Auth  (pymammotion/auth/token_manager.py)               │
 │  TokenManager: one instance per account                  │
@@ -159,7 +160,7 @@ Key files for protocol/logic research:
 - **Python version:** 3.12+
 - **Type stubs** for missing third-party types are in `stubs/`
 - Ruff excludes `pymammotion/proto/`, `tests/`, and `scripts/` from linting
-- ty excludes `pymammotion/proto/**`, `tests/**`, `scripts/**`, `examples/**`, and `pymammotion/mqtt/linkkit/**`
+- ty excludes `pymammotion/proto/**`, `tests/**`, `scripts/**`, and `examples/**`
 - **No local imports inside function bodies** — always use top-level imports. Exception: `TYPE_CHECKING` guards for type-hint-only imports that would cause circular imports at runtime.
 - **Walrus operator (`:=`)** — prefer it wherever it removes a separate assignment line: guards (`if x := foo()`), loop conditions (`while chunk := f.read()`), and inline captures inside comprehensions or `match` arms. Only avoid it when the binding would make the expression harder to read than two lines would.
 

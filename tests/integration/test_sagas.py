@@ -8,7 +8,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from pymammotion.data.model.hash_list import AreaHashNameList, HashList, MowPath, NavGetHashListData, Plan
+from pymammotion.data.model.hash_list import (
+    AreaHashNameList,
+    HashList,
+    MowPath,
+    NavGetHashListData,
+    Plan,
+    RootHashList,
+)
 from pymammotion.messaging.broker import CommandTimeoutError, DeviceMessageBroker
 from pymammotion.messaging.map_saga import MapFetchSaga
 from pymammotion.messaging.mow_path_saga import MowPathSaga
@@ -24,10 +31,16 @@ from pymammotion.messaging.saga import SagaFailedError
 def _make_hash_list_ack_response(
     total_frame: int = 1,
     current_frame: int = 1,
-    sub_cmd: int = 1,
+    sub_cmd: int = 0,
     data_couple: list[int] | None = None,
 ) -> MagicMock:
-    """Create a minimal MagicMock that looks like a LubaMsg with toapp_gethash_ack."""
+    """Create a minimal MagicMock that looks like a LubaMsg with toapp_gethash_ack.
+
+    ``sub_cmd`` defaults to 0 because the root hash list is requested with
+    ``get_all_boundary_hash_list(sub_cmd=0)`` and MapFetchSaga now filters the
+    ``toapp_gethash_ack`` stream to ``sub_cmd == 0`` (rejecting stray sub_cmd=3
+    line-hash frames from an interrupted MowPathSaga).
+    """
     ack = MagicMock()
     ack.pver = 1
     ack.sub_cmd = sub_cmd
@@ -133,7 +146,7 @@ async def test_map_saga_fetches_area_names_for_non_luba1() -> None:
     builder = _make_command_builder()
 
     area_response = _make_area_name_response([(1, "Front lawn")])
-    # sub_cmd=1 (default) → missing_hashlist(0) returns [] so step 4 is skipped
+    # Empty map (get_map=HashList) → missing_hashlist(0) returns [] so step 4 is skipped
     hash_response = _make_hash_list_ack_response(total_frame=1, current_frame=1, data_couple=[])
 
     broker.send_and_wait.return_value = area_response
@@ -337,6 +350,59 @@ async def test_plan_saga_sends_plan_and_waits_for_ack() -> None:
 
     assert saga.result == {}
     builder.read_plan.assert_called_once_with(sub_cmd=2, plan_index=0)
+
+
+async def test_plan_saga_iterates_all_indices_when_total_plan_num_is_3() -> None:
+    """When totalPlanNum=3, PlanFetchSaga must request indices 0, 1, and 2.
+
+    This is a regression test for the bug where only plan_index=0 was ever
+    requested: the device returns totalPlanNum in the first response, and the
+    saga must loop through the remaining indices rather than returning early.
+    """
+    broker = AsyncMock(spec=DeviceMessageBroker)
+    builder = _make_command_builder()
+
+    subscribe_side_effect, active_callbacks = _make_subscribe_ctx()
+    broker.subscribe_unsolicited.side_effect = subscribe_side_effect
+
+    # Three plans, each with a distinct plan_id.  All carry totalPlanNum=3 so the
+    # saga knows the total from the first response and loops for indices 1 and 2.
+    plan_dicts = [
+        {"total_plan_num": 3, "plan_id": "plan-aaa", "plan_index": 0, "task_name": "Plan A"},
+        {"total_plan_num": 3, "plan_id": "plan-bbb", "plan_index": 1, "task_name": "Plan B"},
+        {"total_plan_num": 3, "plan_id": "plan-ccc", "plan_index": 2, "task_name": "Plan C"},
+    ]
+    call_count = 0
+
+    async def send_command(cmd: bytes) -> None:
+        nonlocal call_count
+        if active_callbacks:
+            leaf_val = MagicMock()
+            leaf_val.to_dict.return_value = plan_dicts[call_count]
+            response = MagicMock()
+            # _which_plan is called with response.nav as `obj` when unpacking
+            # SubNavMsg, so the leaf_val must be reachable via response.nav._leaf_val.
+            response.nav._leaf_val = leaf_val
+            call_count += 1
+            await active_callbacks[-1](response)
+
+    def _which_plan(obj: Any, group: str) -> tuple[str, Any]:
+        if group == "LubaSubMsg":
+            return ("nav", obj.nav)
+        return ("todev_planjob_set", obj._leaf_val)
+
+    with patch("betterproto2.which_one_of", side_effect=_which_plan):
+        saga = PlanFetchSaga(command_builder=builder, send_command=send_command)
+        await saga.execute(broker)
+
+    # Saga must have sent one read_plan per index.
+    assert builder.read_plan.call_count == 3
+    builder.read_plan.assert_any_call(sub_cmd=2, plan_index=0)
+    builder.read_plan.assert_any_call(sub_cmd=2, plan_index=1)
+    builder.read_plan.assert_any_call(sub_cmd=2, plan_index=2)
+
+    # All three plans must be in the result.
+    assert set(saga.result.keys()) == {"plan-aaa", "plan-bbb", "plan-ccc"}
 
 
 async def test_plan_saga_retries_on_timeout() -> None:
@@ -710,6 +776,94 @@ async def test_mow_path_saga_preserves_current_mow_path_across_runs() -> None:
     # Only invalidate_mow_path(0) clears it (job ended → cache flush).
     hash_list.invalidate_mow_path(0)
     assert hash_list.current_mow_path == {}
+
+
+async def test_mow_path_saga_syncs_before_route_and_line_info() -> None:
+    """A BLE sync must be sent immediately before generate_route_information and before the
+    first get_line_info_list — the intervening frame loops stale the run's initial sync.
+    """
+
+    class _StopAfterLineInfo(Exception):
+        """Sentinel to halt the saga right after the cover-path request is issued."""
+
+    # Pre-seed a sub_cmd=3 root list with one line hash so the saga reaches step 2 (route)
+    # and step 3-4 (cover paths) instead of early-returning.  current_mow_path stays empty
+    # so the hash counts as "missing" and get_line_info_list is issued.
+    hash_list = HashList()
+    hash_list.root_hash_lists = [
+        RootHashList(
+            total_frame=1,
+            sub_cmd=3,
+            data=[NavGetHashListData(sub_cmd=3, total_frame=1, current_frame=1, data_couple=[100])],
+        )
+    ]
+
+    broker = AsyncMock(spec=DeviceMessageBroker)
+    subscribe_side_effect, active_callbacks = _make_subscribe_ctx()
+    broker.subscribe_unsolicited.side_effect = subscribe_side_effect
+
+    # Route response returned by the (mocked) send_and_wait for step 2.
+    route_val = MagicMock(sub_cmd=0, path_hash=0)
+    route_response = MagicMock()
+    route_response.nav.bidire_reqconver_path = route_val
+    broker.send_and_wait.return_value = route_response
+
+    # Step-1 hash frame (sub_cmd=3, single frame) fed when the line-hash-list request is sent.
+    hash_frame = MagicMock()
+    hash_frame.nav.toapp_gethash_ack = MagicMock(sub_cmd=3, current_frame=1, total_frame=1)
+
+    cb = MagicMock()
+    cb.send_todev_ble_sync.return_value = b"ble_sync"
+    cb.get_all_boundary_hash_list.return_value = b"hash_list_cmd"
+    cb.get_hash_response.return_value = b"hash_response_cmd"
+    cb.generate_route_information.return_value = b"route_cmd"
+    cb.get_line_info_list.side_effect = _StopAfterLineInfo  # halt once the cover-path request fires
+
+    async def send_command(cmd: bytes) -> None:
+        if cmd == b"hash_list_cmd" and active_callbacks:
+            await active_callbacks[-1](hash_frame)
+
+    def _which(obj: Any, group: str) -> tuple[str, Any]:
+        if group == "LubaSubMsg":
+            return ("nav", obj.nav)
+        # SubNavMsg: the route response carries an int sub_cmd on bidire_reqconver_path.
+        bidire = getattr(obj, "bidire_reqconver_path", None)
+        if isinstance(getattr(bidire, "sub_cmd", None), int):
+            return ("bidire_reqconver_path", bidire)
+        return ("toapp_gethash_ack", obj.toapp_gethash_ack)
+
+    with patch("betterproto2.which_one_of", side_effect=_which), patch("asyncio.sleep", new_callable=AsyncMock):
+        saga = MowPathSaga(
+            command_builder=cb,
+            send_command=send_command,
+            get_map=lambda: hash_list,
+            zone_hashs=[100],
+            sync_type=2,  # BLE
+        )
+        saga.step_timeout = 0.01
+        with pytest.raises(_StopAfterLineInfo):
+            await saga.execute(broker)
+
+    names = [
+        c[0]
+        for c in cb.mock_calls
+        if c[0]
+        in {
+            "send_todev_ble_sync",
+            "get_all_boundary_hash_list",
+            "get_hash_response",
+            "generate_route_information",
+            "get_line_info_list",
+        }
+    ]
+
+    route_idx = names.index("generate_route_information")
+    assert names[route_idx - 1] == "send_todev_ble_sync", f"no sync before route: {names[: route_idx + 1]}"
+
+    line_idx = names.index("get_line_info_list")
+    assert names[line_idx - 1] == "send_todev_ble_sync", f"no sync before cover-path: {names[: line_idx + 1]}"
+
+    cb.send_todev_ble_sync.assert_called_with(sync_type=2)
 
 
 # ---------------------------------------------------------------------------

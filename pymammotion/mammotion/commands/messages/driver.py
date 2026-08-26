@@ -119,9 +119,36 @@ class MessageDriver(AbstractMessage, ABC):
         logger.debug(f"Control command print, linearSpeed={linear_speed} // angularSpeed={angular_speed}")
         return self.send_order_msg_driver(
             MctlDriver(
-                todev_devmotion_ctrl=DrvMotionCtrl(set_linear_speed=linear_speed, set_angular_speed=angular_speed)
+                todev_devmotion_ctrl=DrvMotionCtrl(
+                    set_linear_speed=linear_speed,
+                    set_angular_speed=angular_speed,
+                    channel=1,
+                )
             )
         )
+
+    def send_test_movement(self, linear_speed: int, angular_speed: int) -> bytes:
+        """Send the firmware's factory-motion test command over BLE channel 1.
+
+        Current app descriptors expose ``DrvMotionCtrlTest`` as MctlDriver
+        field 15. Encode it as an unknown field until the generated protobuf
+        bindings include that message.
+        """
+        motion = DrvMotionCtrl(
+            set_linear_speed=linear_speed,
+            set_angular_speed=angular_speed,
+            channel=1,
+        ).SerializeToString()
+        driver = MctlDriver()
+        driver._unknown_fields = (  # noqa: SLF001
+            b"\x7a" + bytes((len(motion),)) + motion
+        )
+        logger.debug(
+            "Factory motion test, linearSpeed=%s // angularSpeed=%s",
+            linear_speed,
+            angular_speed,
+        )
+        return self.send_order_msg_driver(driver)
 
     def manual_grass_collection(self, collect_ctrl: int) -> bytes:
         """Manual grass collection control (0=off, 1=on)."""
